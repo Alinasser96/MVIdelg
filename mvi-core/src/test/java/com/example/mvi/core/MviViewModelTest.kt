@@ -1,19 +1,22 @@
 package com.example.mvi.core
 
+import androidx.lifecycle.ViewModel
 import app.cash.turbine.test
+import com.example.mvi.core.helpers.DispatcherProvider
 import com.example.mvi.core.navigation.ChannelNavigator
 import com.example.mvi.core.navigation.NavCommand
 import com.example.mvi.core.plugins.HasErrorPlugin
 import com.example.mvi.core.plugins.HasLoadingPlugin
 import com.example.mvi.core.plugins.HasLoggingPlugin
 import com.example.mvi.core.plugins.HasNavigationPlugin
+import com.example.mvi.core.plugins.MVIPlugin
 import com.example.mvi.core.plugins.MviPluginDependencies
 import com.example.mvi.core.plugins.configureLogging
 import com.example.mvi.core.plugins.errors
 import com.example.mvi.core.plugins.loading
 import com.example.mvi.core.plugins.logging
 import com.example.mvi.core.plugins.navigation
-import com.example.mvi.core.helpers.DispatcherProvider
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -42,12 +45,14 @@ class MviViewModelTest {
     private fun dispatchers(): DispatcherProvider =
         TestDispatcherProvider(mainDispatcherRule.testDispatcher)
 
-    private fun viewModel() = FullyLoadedViewModel(dispatchers(), dependencies())
+    private fun viewModel(extraPlugins: List<MVIPlugin> = emptyList()) =
+        FullyLoadedViewModel(dispatchers(), dependencies(), extraPlugins)
+
+    // ---- The loop ----
 
     @Test
     fun `intents are reduced into state in order`() = runTest {
         val viewModel = viewModel()
-        viewModel.viewState.value // touch: lazy init starts the intent collector
 
         viewModel.processIntent(CounterIntent.Increment)
         viewModel.processIntent(CounterIntent.Increment)
@@ -59,18 +64,14 @@ class MviViewModelTest {
     }
 
     @Test
-    fun `intents sent before the state is observed are not lost`() = runTest {
+    fun `intents are handled without anything ever observing viewState`() = runTest {
         val viewModel = viewModel()
 
-        // Nothing has touched viewState, so the collector has not started yet. The
-        // UNLIMITED channel parks these until it does.
+        // The collector starts in init, so nothing has to touch viewState first.
         viewModel.processIntent(CounterIntent.Increment)
-        viewModel.processIntent(CounterIntent.Increment)
-
-        viewModel.viewState.value
         advanceUntilIdle()
 
-        assertEquals(2, viewModel.viewState.value.count)
+        assertEquals(1, viewModel.viewState.value.count)
     }
 
     @Test
@@ -80,24 +81,41 @@ class MviViewModelTest {
         assertEquals(CounterState(), viewModel.viewState.value)
     }
 
+    // ---- Effects ----
+
     @Test
-    fun `effects are emitted to a collector`() = runTest {
+    fun `effects emitted before anyone collects are buffered, not lost`() = runTest {
         val viewModel = viewModel()
-        viewModel.viewState.value
+
+        viewModel.processIntent(CounterIntent.Celebrate)
+        advanceUntilIdle()
 
         viewModel.effect.test {
-            viewModel.processIntent(CounterIntent.Celebrate)
-            advanceUntilIdle()
-
             assertEquals(CounterEffect.Toast("nice"), awaitItem())
         }
     }
 
     @Test
+    fun `an effect is delivered once and never replayed`() = runTest {
+        val viewModel = viewModel()
+
+        viewModel.effect.test {
+            viewModel.processIntent(CounterIntent.Celebrate)
+            advanceUntilIdle()
+            assertEquals(CounterEffect.Toast("nice"), awaitItem())
+        }
+
+        // A replaying SharedFlow would hand the same effect to this second collector -
+        // which is how "the app navigates twice after rotation" bugs happen.
+        viewModel.effect.test { expectNoEvents() }
+    }
+
+    // ---- Plugin installation ----
+
+    @Test
     fun `a plugin is installed only when its marker is implemented`() = runTest {
         val loaded = viewModel()
 
-        // Declared markers -> the accessors resolve and the plugins are live.
         assertFalse(loaded.loading.isLoading.value)
         assertNull(loaded.errors.error.value)
 
@@ -111,9 +129,85 @@ class MviViewModelTest {
     }
 
     @Test
+    fun `plugins are created eagerly, so a subclass can navigate from its own init`() = runTest {
+        // Regression: plugin onCreate used to run only when viewState was first read, so
+        // navigating from init threw UninitializedPropertyAccessException.
+        navigator.commands.test {
+            NavigatingOnInitViewModel(dispatchers(), dependencies())
+            assertEquals(NavCommand.To(TestDestination("from-init")), awaitItem())
+        }
+    }
+
+    @Test
+    fun `additionalPlugins are installed alongside the four the markers control`() = runTest {
+        val extra = RecordingPlugin()
+        val viewModel = viewModel(listOf(extra))
+
+        assertTrue(extra.created)
+
+        viewModel.processIntent(CounterIntent.Increment)
+        advanceUntilIdle()
+
+        assertEquals(listOf(CounterIntent.Increment), extra.seenIntents)
+    }
+
+    // ---- The onIntent hook ----
+
+    @Test
+    fun `a plugin can consume an intent before handleIntent sees it`() = runTest {
+        val gatekeeper = RecordingPlugin(consume = { it == CounterIntent.Increment })
+        val viewModel = viewModel(listOf(gatekeeper))
+
+        viewModel.processIntent(CounterIntent.Increment)
+        advanceUntilIdle()
+
+        assertEquals(listOf(CounterIntent.Increment), gatekeeper.seenIntents)
+        assertEquals(0, viewModel.viewState.value.count)
+    }
+
+    @Test
+    fun `every plugin observes an intent even when an earlier one consumes it`() = runTest {
+        val consumer = RecordingPlugin(consume = { true })
+        val observer = RecordingPlugin()
+        val viewModel = viewModel(listOf(consumer, observer))
+
+        viewModel.processIntent(CounterIntent.Increment)
+        advanceUntilIdle()
+
+        // `any { }` short-circuits, so mapping first is what stops a plugin's visibility
+        // depending on its position in the list.
+        assertEquals(listOf(CounterIntent.Increment), observer.seenIntents)
+    }
+
+    // ---- Plugin broadcasts ----
+
+    @Test
+    fun `updateState reports the old and new state to plugins`() = runTest {
+        val recorder = RecordingPlugin()
+        val viewModel = viewModel(listOf(recorder))
+
+        viewModel.processIntent(CounterIntent.Increment)
+        advanceUntilIdle()
+
+        assertEquals(listOf(CounterState(0) to CounterState(1)), recorder.stateChanges)
+    }
+
+    @Test
+    fun `emitEffect reports to plugins`() = runTest {
+        val recorder = RecordingPlugin()
+        val viewModel = viewModel(listOf(recorder))
+
+        viewModel.processIntent(CounterIntent.Celebrate)
+        advanceUntilIdle()
+
+        assertEquals(listOf(CounterEffect.Toast("nice")), recorder.effects)
+    }
+
+    // ---- Installed plugin behaviour ----
+
+    @Test
     fun `the loading plugin drives the spinner across a suspending intent`() = runTest {
         val viewModel = viewModel()
-        viewModel.viewState.value
 
         viewModel.loading.isLoading.test {
             assertFalse(awaitItem())
@@ -133,20 +227,17 @@ class MviViewModelTest {
     @Test
     fun `a failing intent lands in the error plugin, not in the screen state`() = runTest {
         val viewModel = viewModel()
-        viewModel.viewState.value
 
         viewModel.processIntent(CounterIntent.Explode)
         advanceUntilIdle()
 
         assertEquals("boom", viewModel.errors.error.value?.message)
-        // The screen's own state never grew an error field.
         assertEquals(CounterState(), viewModel.viewState.value)
     }
 
     @Test
     fun `navigation goes through the plugin, never through the ViewModel`() = runTest {
         val viewModel = viewModel()
-        viewModel.viewState.value
 
         navigator.commands.test {
             viewModel.processIntent(CounterIntent.GoHome)
@@ -159,7 +250,6 @@ class MviViewModelTest {
     @Test
     fun `analytics are logged through the logging plugin`() = runTest {
         val viewModel = viewModel()
-        viewModel.viewState.value
 
         viewModel.processIntent(CounterIntent.Increment)
         advanceUntilIdle()
@@ -168,30 +258,19 @@ class MviViewModelTest {
         assertEquals("counter", analytics.events.first().screenId)
     }
 
-    @Test
-    fun `plugins are not created until the state is observed`() = runTest {
-        val viewModel = viewModel()
-
-        // NavigationPluginImpl gets its Navigator in onCreate, which the lazy viewState
-        // triggers. Navigating before anything observes the screen would throw - worth
-        // knowing, because it makes "navigate straight from init" a trap.
-        val threw = runCatching { viewModel.navigation.navigateTo(TestDestination("home")) }.isFailure
-        assertTrue(threw)
-
-        viewModel.viewState.value
-        viewModel.navigation.navigateTo(TestDestination("home"))
-    }
+    // ---- Teardown ----
 
     @Test
-    fun `onCleared closes the intent channel`() = runTest {
-        val viewModel = viewModel()
-        viewModel.viewState.value
+    fun `onCleared closes the channels and tells the plugins`() = runTest {
+        val recorder = RecordingPlugin()
+        val viewModel = viewModel(listOf(recorder))
         advanceUntilIdle()
 
         viewModel.clear()
         viewModel.processIntent(CounterIntent.Increment)
         advanceUntilIdle()
 
+        assertTrue(recorder.cleared)
         assertEquals(0, viewModel.viewState.value.count)
     }
 }
@@ -213,11 +292,53 @@ private sealed interface CounterEffect : Effect {
     data class Toast(val message: String) : CounterEffect
 }
 
+/** Records every hook, and optionally claims intents. */
+private class RecordingPlugin(
+    private val consume: (Intent) -> Boolean = { false },
+) : MVIPlugin {
+
+    var created = false
+    var cleared = false
+    val seenIntents = mutableListOf<Intent>()
+    val stateChanges = mutableListOf<Pair<ViewState, ViewState>>()
+    val effects = mutableListOf<Effect>()
+
+    override fun onCreate(
+        viewModel: ViewModel,
+        viewModelScope: CoroutineScope,
+        dependencies: MviPluginDependencies,
+    ) {
+        created = true
+    }
+
+    override fun onIntent(intent: Intent): Boolean {
+        seenIntents += intent
+        return consume(intent)
+    }
+
+    override fun onStateChanged(oldState: ViewState, newState: ViewState) {
+        stateChanges += oldState to newState
+    }
+
+    override fun onEffectEmitted(effect: Effect) {
+        effects += effect
+    }
+
+    override fun onCleared() {
+        cleared = true
+    }
+}
+
 /** A screen that opts into all four plugins. */
 private class FullyLoadedViewModel(
     dispatcherProvider: DispatcherProvider,
     pluginDependencies: MviPluginDependencies,
-) : MviViewModel<CounterState, CounterIntent, CounterEffect>(dispatcherProvider, pluginDependencies),
+    extraPlugins: List<MVIPlugin> = emptyList(),
+) : MviViewModel<CounterState, CounterIntent, CounterEffect>(
+    dispatcherProvider,
+    pluginDependencies,
+    extraPlugins,
+),
     HasLoadingPlugin,
     HasErrorPlugin,
     HasNavigationPlugin,
@@ -253,6 +374,22 @@ private class FullyLoadedViewModel(
     }
 
     fun clear() = onCleared()
+}
+
+/** Proves plugins are usable from a subclass's own init block. */
+private class NavigatingOnInitViewModel(
+    dispatcherProvider: DispatcherProvider,
+    pluginDependencies: MviPluginDependencies,
+) : MviViewModel<CounterState, CounterIntent, NoEffect>(dispatcherProvider, pluginDependencies),
+    HasNavigationPlugin {
+
+    init {
+        navigation.navigateTo(TestDestination("from-init"))
+    }
+
+    override fun initialState() = CounterState()
+
+    override suspend fun handleIntent(intent: CounterIntent) = Unit
 }
 
 /** A screen that opts into nothing. No plugin is installed for it. */

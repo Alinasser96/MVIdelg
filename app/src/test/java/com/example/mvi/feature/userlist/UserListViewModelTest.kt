@@ -50,7 +50,6 @@ class UserListViewModelTest {
     @Test
     fun `Load fills the list and clears the spinner`() = runTest {
         val viewModel = viewModel(FakeUserRepository(userCount = 3))
-        viewModel.viewState.value // lazy init: start the intent collector
 
         viewModel.processIntent(UserListIntent.Load)
         advanceUntilIdle()
@@ -64,7 +63,6 @@ class UserListViewModelTest {
     fun `a failure lands in the error plugin and the spinner still clears`() = runTest {
         val repository = FakeUserRepository(userCount = 3, failing = true)
         val viewModel = viewModel(repository)
-        viewModel.viewState.value
 
         viewModel.processIntent(UserListIntent.Load)
         advanceUntilIdle()
@@ -79,7 +77,6 @@ class UserListViewModelTest {
     fun `Retry clears the previous error and reloads`() = runTest {
         val repository = FakeUserRepository(userCount = 3, failing = true)
         val viewModel = viewModel(repository)
-        viewModel.viewState.value
 
         viewModel.processIntent(UserListIntent.Load)
         advanceUntilIdle()
@@ -96,7 +93,6 @@ class UserListViewModelTest {
     @Test
     fun `tapping a user navigates through the plugin, not through state or an effect`() = runTest {
         val viewModel = viewModel(FakeUserRepository(userCount = 3))
-        viewModel.viewState.value
         val stateBefore = viewModel.viewState.value
 
         navigator.commands.test {
@@ -111,7 +107,6 @@ class UserListViewModelTest {
     @Test
     fun `intents are logged through the logging plugin`() = runTest {
         val viewModel = viewModel(FakeUserRepository(userCount = 3))
-        viewModel.viewState.value
 
         viewModel.processIntent(UserListIntent.UserClicked(1))
         advanceUntilIdle()
@@ -125,7 +120,6 @@ class UserListViewModelTest {
     @Test
     fun `toggling failure updates state and announces it via an effect`() = runTest {
         val viewModel = viewModel(FakeUserRepository(userCount = 3))
-        viewModel.viewState.value
 
         viewModel.effect.test {
             viewModel.processIntent(UserListIntent.SimulateFailureToggled(true))

@@ -30,23 +30,29 @@ The parent class. Owns the loop; installs plugins by marker.
 abstract class MviViewModel<T : ViewState, I : Intent, E : Effect>(
     dispatcherProvider: DispatcherProvider,
     pluginDependencies: MviPluginDependencies,
+    additionalPlugins: List<MVIPlugin> = emptyList(),
 ) : ViewModel()
 ```
 
 | Member | |
 | --- | --- |
-| `viewState: StateFlow<T>` | What the UI collects. **`by lazy`** — first access starts plugin `onCreate` and the intent collector. |
+| `viewState: StateFlow<T>` | What the UI collects. |
 | `currentState: T` | Read state inside the ViewModel. Never from the UI. |
-| `effect: SharedFlow<E>` | One-shot events. No replay, no buffer. |
+| `effect: Flow<E>` | One-shot events, over a `Channel`. Buffered, delivered once, never replayed. |
 | `processIntent(i)` | Called by the UI. Non-suspending, ordered, never dropped. |
-| `initialState(): T` *abstract* | The state before anything loads. |
+| `initialState(): T` *abstract* | The state before anything loads. Called lazily. |
 | `handleIntent(i)` *abstract, suspend* | Route one intent. **May suspend** — intents are serialized, so awaiting is correct. |
-| `updateState { }` *protected* | Reduce, then broadcast `onStateChanged` to plugins. |
-| `emitEffect(e)` *protected* | Emit on `dispatcherProvider.main`, then broadcast `onEffectEmitted`. |
+| `updateState { }` *protected* | Atomic reduce via `getAndUpdate`, then broadcast `onStateChanged`. The reducer must be **pure** — it may run twice. |
+| `emitEffect(e)` *protected* | Queue an effect, then broadcast `onEffectEmitted`. Non-suspending. |
 
-Intents arrive on a `Channel(UNLIMITED)`. Plugins get first look via
-`plugins.any { it.onIntent(intent) }`; a plugin returning `true` consumes the intent and
-`handleIntent` never sees it.
+Intents arrive on a `Channel(UNLIMITED)`. Every plugin sees every intent via
+`plugins.map { it.onIntent(intent) }.any { it }` — mapped before reduced, so a plugin's
+visibility never depends on its position in the list — and any plugin returning `true`
+consumes the intent so `handleIntent` never sees it.
+
+Plugins are created in `init`, before any subclass `init` runs, so they are usable from a
+subclass constructor. Only `initialState()` is deferred, because calling an abstract member
+from the base constructor would run before the subclass finished initializing.
 
 ## Plugins
 
@@ -100,15 +106,23 @@ CollectNavigation(navigator) { command -> /* apply to the NavHost */ }  // once,
 
 ---
 
-## Adding a fifth plugin
+## Adding a plugin
+
+**Feature-local** — pass it in, no changes to `:mvi-core`:
+
+```kotlin
+) : MviViewModel<S, I, E>(dispatcherProvider, pluginDependencies, listOf(MyPlugin()))
+```
+
+**App-wide with a marker and accessor** — only worth it for concerns every module shares:
 
 1. Implement `MVIPlugin`.
 2. Add the marker to `PluginMarkers.kt`.
 3. Add the accessor to `PluginAccessors.kt`.
 4. Add the install line and `plugins` list entry in `MviViewModel`.
 
-Step 4 means the plugin set is **closed** — a feature module cannot register its own. That
-is the deliberate trade for zero per-screen wiring and non-null accessors.
+Step 4 is what buys the non-null accessor and the compile-time scoping; `additionalPlugins`
+is the escape hatch when that price isn't worth paying.
 
 ---
 

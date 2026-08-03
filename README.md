@@ -73,8 +73,9 @@ abstract class MviViewModel<T : ViewState, I : Intent, E : Effect>(
 ) : ViewModel() {
 
     private val intentChannel = Channel<I>(Channel.UNLIMITED)
+    private val effectChannel = Channel<E>(Channel.BUFFERED)
     val viewState: StateFlow<T>
-    val effect: SharedFlow<E>
+    val effect: Flow<E>
 
     abstract fun initialState(): T
     abstract suspend fun handleIntent(intent: I)
@@ -331,17 +332,36 @@ fun `a failure lands in the error plugin`() = runTest {
 
 When two screens need the same cross-cutting behaviour, that is the signal.
 
+There are two kinds, and the difference is who owns the plugin.
+
+**App-wide, marker-installed** — the four in `:mvi-core`. Getting a fifth means:
+
 1. Implement `MVIPlugin`, overriding only the hooks you need.
 2. Add a `HasXxxPlugin` marker in `PluginMarkers.kt`.
 3. Add the accessor in `PluginAccessors.kt`.
 4. Add the install line and the `plugins` list entry in `MviViewModel`.
 
-**Step 4 is the one closed part of the design, and it's worth knowing about**: the plugin
-set is hardcoded in the base class, so a new plugin means editing `MviViewModel` — and a
-feature module can't define its own. That is the deliberate trade for auto-installation
-with zero per-screen wiring and compile-time safety. If you later want open registration,
-the change is to build `plugins` from a list supplied through `MviPluginDependencies`,
-at the cost of the `this is HasXxxPlugin` check and the non-null accessors.
+That earns a non-null accessor and compile-time scoping, at the cost of editing the base —
+so it only pays for concerns every module genuinely shares.
+
+**Feature-local** — anything else. Pass it in and skip all four steps:
+
+```kotlin
+class OrdersViewModel(
+    dispatcherProvider: DispatcherProvider,
+    pluginDependencies: MviPluginDependencies,
+) : MviViewModel<OrdersViewState, OrdersIntent, OrdersEffect>(
+    dispatcherProvider,
+    pluginDependencies,
+    additionalPlugins = listOf(PaginationPlugin(pageSize = 20)),
+)
+```
+
+The plugin gets the same five hooks and the same `onCreate` dependencies; you just hold the
+reference yourself instead of reaching it through a marker. `additionalPlugins` is a
+constructor parameter rather than an overridable function deliberately — an open function
+would be called during the base class's initialization, before the subclass's own
+properties exist.
 
 ---
 
@@ -370,14 +390,18 @@ feature.
 **Prefer `withLoading` and `runCatchingError` over manual flags.** The `finally` in
 `withLoading` is why a spinner never sticks after a thrown exception.
 
-**Nothing spins up until the screen is observed.** `viewState` is `by lazy`, and plugin
-`onCreate` plus the intent collector both start on first access. Intents sent before then
-are parked safely in the channel — but calling `navigation.navigateTo(...)` from `init`
-throws, because the plugin has no `Navigator` yet. Navigate from an intent, not from `init`.
+**Plugins are ready before your `init` runs.** They are created in the base class's `init`,
+not on first read of `viewState`, so `navigation.navigateTo(...)` from a subclass `init` is
+safe. Only `initialState()` stays lazy, because it is abstract and calling it from the base
+constructor would run before the subclass finished initializing.
 
-**Effects have no replay and no buffer.** `emitEffect` suspends until a collector is
-active, so an effect emitted while the screen is stopped is delivered when it returns —
-but ordering across several such effects isn't guaranteed. Keep effects few.
+**`updateState` uses `getAndUpdate`, so the reducer must be pure.** It can run more than
+once under contention — never send an effect or start work inside it. The atomicity
+matters because `updateState` is `protected`: a subclass collecting a flow in its own
+coroutine can call it concurrently with intent handling.
+
+**Effects go through a `Channel`, like intents.** Sending never suspends, buffering is
+explicit, and each effect reaches exactly one collector and is never replayed on rotation.
 
 ---
 
@@ -396,7 +420,7 @@ purpose. Tap a row to see `NavigationPlugin` drive the NavHost, and watch Logcat
 ./gradlew test
 ```
 
-24 unit tests, all JVM, no emulator: 11 for the base class, 7 for the plugins standalone,
+30 unit tests, all JVM, no emulator: 17 for the base class, 7 for the plugins standalone,
 6 for a full screen.
 
 ---

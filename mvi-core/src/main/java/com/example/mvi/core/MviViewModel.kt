@@ -14,11 +14,11 @@ import com.example.mvi.core.plugins.MVIPlugin
 import com.example.mvi.core.plugins.MviPluginDependencies
 import com.example.mvi.core.plugins.NavigationPluginImpl
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 
@@ -26,7 +26,7 @@ import kotlinx.coroutines.launch
  * Core MVI ViewModel.
  *
  * The parent class owns the MVI loop outright — the intent channel, the state flow, the
- * effect flow, and the reducer. There is no indirection to chase: `updateState`,
+ * effect channel, and the reducer. There is no indirection to chase: `updateState`,
  * `emitEffect` and `processIntent` are all right here.
  *
  * **Plugins are automatically installed based on implemented interfaces.** Just implement
@@ -58,10 +58,17 @@ import kotlinx.coroutines.launch
  *     }
  * }
  * ```
+ *
+ * @param additionalPlugins plugins this screen supplies itself, installed alongside the
+ *   four the markers control. This is the seam that lets a *feature* module define a
+ *   plugin without the base class having to know about it. It is a constructor parameter
+ *   rather than an overridable function on purpose: an open function would be called
+ *   during this class's initialization, before the subclass's own properties exist.
  */
 abstract class MviViewModel<T : ViewState, I : Intent, E : Effect>(
     protected val dispatcherProvider: DispatcherProvider,
     private val pluginDependencies: MviPluginDependencies,
+    additionalPlugins: List<MVIPlugin> = emptyList(),
 ) : ViewModel() {
 
     internal val _loadingPlugin: LoadingPluginImpl? =
@@ -81,38 +88,49 @@ abstract class MviViewModel<T : ViewState, I : Intent, E : Effect>(
         _errorPlugin,
         _navigationPlugin,
         _loggingPlugin,
-    )
+    ) + additionalPlugins
 
     private val intentChannel = Channel<I>(Channel.UNLIMITED)
 
     /**
-     * Lazy on purpose: nothing spins up until something actually observes the screen.
-     * Plugin `onCreate` and the intent collector both start on first access to
-     * [viewState]. Until then intents are safely parked in the UNLIMITED channel.
+     * Effects go through a channel, for the same reasons intents do: sending never
+     * suspends, buffering is explicit, and each effect is delivered to exactly one
+     * collector and never replayed on rotation.
      */
-    private val _viewState: MutableStateFlow<T> by lazy {
-        MutableStateFlow(initialState()).also {
-            plugins.forEach { plugin -> plugin.onCreate(this, viewModelScope, pluginDependencies) }
-            viewModelScope.launch {
-                intentChannel.receiveAsFlow().collect { intent ->
-                    // Plugins get first look. Any plugin returning true consumes the
-                    // intent, and the feature's handleIntent never sees it.
-                    val handled = plugins.any { plugin -> plugin.onIntent(intent) }
-                    if (!handled) {
-                        handleIntent(intent)
-                    }
+    private val effectChannel = Channel<E>(Channel.BUFFERED)
+
+    /**
+     * Only [initialState] stays lazy, because it is an abstract member and calling it
+     * from this constructor would run before the subclass finished initializing. Plugin
+     * setup deliberately does *not* wait for it — see the `init` block.
+     */
+    private val _viewState: MutableStateFlow<T> by lazy { MutableStateFlow(initialState()) }
+
+    val viewState: StateFlow<T> by lazy { _viewState.asStateFlow() }
+
+    val effect: Flow<E> = effectChannel.receiveAsFlow()
+
+    protected val currentState: T
+        get() = _viewState.value
+
+    init {
+        // Plugins are created eagerly, not on first observation of viewState. Deferring
+        // this used to mean `navigation.navigateTo(...)` from a subclass init threw,
+        // because the plugin had no Navigator yet.
+        plugins.forEach { plugin -> plugin.onCreate(this, viewModelScope, pluginDependencies) }
+
+        viewModelScope.launch {
+            intentChannel.receiveAsFlow().collect { intent ->
+                // Every plugin sees every intent; any of them may claim it. Mapping
+                // before reducing matters: `any { }` short-circuits, which would make
+                // whether a plugin observes an intent depend on its position in the list.
+                val handled = plugins.map { plugin -> plugin.onIntent(intent) }.any { it }
+                if (!handled) {
+                    handleIntent(intent)
                 }
             }
         }
     }
-
-    val viewState: StateFlow<T> by lazy { _viewState.asStateFlow() }
-
-    private val _effect = MutableSharedFlow<E>()
-    val effect = _effect.asSharedFlow()
-
-    protected val currentState: T
-        get() = _viewState.value
 
     abstract fun initialState(): T
 
@@ -124,28 +142,32 @@ abstract class MviViewModel<T : ViewState, I : Intent, E : Effect>(
     }
 
     /**
-     * Reduce state, then notify plugins.
+     * Atomically reduce state, then notify plugins.
      *
-     * The `onStateChanged(old, new)` broadcast is what lets a plugin react to state
-     * without the feature knowing it exists — analytics on a step change, for instance.
+     * [getAndUpdate] rather than a read-modify-write pair: `updateState` is `protected`,
+     * so a subclass collecting a flow in its own coroutine can call it concurrently with
+     * intent handling, and a plain assignment would silently drop one of the two updates.
+     *
+     * [reducer] must therefore be **pure** — it may run more than once under contention.
      */
     protected fun updateState(reducer: T.() -> T) {
-        val oldState = currentState
-        _viewState.value = currentState.reducer()
-        val newState = currentState
+        lateinit var newState: T
+        val oldState = _viewState.getAndUpdate { current ->
+            current.reducer().also { newState = it }
+        }
         plugins.forEach { it.onStateChanged(oldState, newState) }
     }
 
+    /** Queues a one-shot effect. Non-suspending, so it is safe from any reducer branch. */
     protected fun emitEffect(effect: E) {
-        viewModelScope.launch(dispatcherProvider.main) {
-            _effect.emit(effect)
-            plugins.forEach { it.onEffectEmitted(effect) }
-        }
+        effectChannel.trySend(effect)
+        plugins.forEach { it.onEffectEmitted(effect) }
     }
 
     override fun onCleared() {
         super.onCleared()
         intentChannel.close()
+        effectChannel.close()
         plugins.forEach { it.onCleared() }
     }
 }
