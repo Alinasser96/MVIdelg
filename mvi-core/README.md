@@ -106,23 +106,39 @@ CollectNavigation(navigator) { command -> /* apply to the NavHost */ }  // once,
 
 ---
 
-## Adding a plugin
+## Adding a plugin from outside this module
 
-**Feature-local** — pass it in, no changes to `:mvi-core`:
+No changes to `:mvi-core` required.
 
 ```kotlin
-) : MviViewModel<S, I, E>(dispatcherProvider, pluginDependencies, listOf(MyPlugin()))
+class UndoPlugin : MVIPlugin { /* override the hooks you need */ }
+
+interface HasUndoPlugin
+
+val HasUndoPlugin.undo: UndoPlugin
+    get() = (this as MviViewModel<*, *, *>).requirePlugin()
+
+class EditorViewModel(
+    dispatcherProvider: DispatcherProvider,
+    pluginDependencies: MviPluginDependencies,
+    undoPlugin: UndoPlugin = UndoPlugin(),
+) : MviViewModel<S, I, E>(dispatcherProvider, pluginDependencies, listOf(undoPlugin)),
+    HasUndoPlugin
 ```
 
-**App-wide with a marker and accessor** — only worth it for concerns every module shares:
+| Lookup | |
+| --- | --- |
+| `requirePlugin<P>()` | The installed plugin, or throws naming the missing type. |
+| `pluginOrNull<P>()` | Null when not installed, for genuinely optional plugins. |
+| `pluginOrNull(KClass<P>)` | Non-reified member the two above delegate to. |
 
-1. Implement `MVIPlugin`.
-2. Add the marker to `PluginMarkers.kt`.
-3. Add the accessor to `PluginAccessors.kt`.
-4. Add the install line and `plugins` list entry in `MviViewModel`.
+Worked example, written from a consumer module:
+[CustomPluginTest.kt](../app/src/test/java/com/example/mvi/CustomPluginTest.kt).
 
-Step 4 is what buys the non-null accessor and the compile-time scoping; `additionalPlugins`
-is the escape hatch when that price isn't worth paying.
+**Only edit `:mvi-core`** to get marker-alone auto-installation like the built-in four —
+add the marker to `PluginMarkers.kt`, the accessor to `PluginAccessors.kt`, and the install
+line plus `plugins` entry in `MviViewModel`. That saves the explicit `additionalPlugins`
+argument, at the cost of a base-class change and a new `:mvi-core` dependency.
 
 ---
 

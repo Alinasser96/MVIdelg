@@ -378,20 +378,99 @@ graph TD
     Q2 -->|"no"| E["Effect"]
 ```
 
-## Adding a plugin
+## Adding your own plugin
 
-**Feature-local** — pass it in, change nothing in `:mvi-core`:
+**You never have to fork or edit `:mvi-core`.** Four steps, all in your own module — the
+result behaves exactly like the built-in four.
+
+### Step 1. Write the plugin
+
+Implement `MVIPlugin` and override only the hooks you need. All five have defaults.
+
+| Hook | When it runs | Use it for |
+| --- | --- | --- |
+| `onCreate(viewModel, scope, dependencies)` | Once, during ViewModel construction | Grab the navigator, logger or dispatchers |
+| `onIntent(intent): Boolean` | Before `handleIntent`, for every intent | Observe — or return `true` to **consume** it |
+| `onStateChanged(old, new)` | After every `updateState` | React to state without the screen knowing |
+| `onEffectEmitted(effect)` | After every `emitEffect` | Audit or mirror effects |
+| `onCleared()` | With the ViewModel | Release anything you held |
 
 ```kotlin
-) : MviViewModel<S, I, E>(dispatcherProvider, pluginDependencies, listOf(PaginationPlugin()))
+class UndoPlugin : MVIPlugin {
+    val history = mutableListOf<String>()
+
+    override fun onStateChanged(oldState: ViewState, newState: ViewState) {
+        if (oldState is EditViewState && newState is EditViewState && oldState.text != newState.text) {
+            history += oldState.text
+        }
+    }
+
+    fun previous(): String = history.removeLastOrNull() ?: ""
+}
 ```
 
-**App-wide with a marker** — worth it only for concerns every module shares: implement
-`MVIPlugin`, add the marker to `PluginMarkers.kt`, add the accessor to
-`PluginAccessors.kt`, add the install line in `MviViewModel`.
+### Step 2. Add a marker interface
 
-Plugin hooks: `onCreate` · `onIntent` (return `true` to consume) · `onStateChanged` ·
-`onEffectEmitted` · `onCleared`. All have defaults; override only what you need.
+```kotlin
+interface HasUndoPlugin
+```
+
+### Step 3. Add an accessor
+
+`requirePlugin()` looks your plugin up among the installed ones. Because the property
+extends the marker, it only resolves inside a class that declared it — the same
+compile-time scoping the built-ins get.
+
+```kotlin
+val HasUndoPlugin.undo: UndoPlugin
+    get() = (this as MviViewModel<*, *, *>).requirePlugin()
+```
+
+Use `pluginOrNull<UndoPlugin>()` instead if the plugin is genuinely optional.
+
+### Step 4. Install it
+
+Pass it to `additionalPlugins` and implement the marker.
+
+```kotlin
+class EditorViewModel(
+    dispatcherProvider: DispatcherProvider,
+    pluginDependencies: MviPluginDependencies,
+    undoPlugin: UndoPlugin = UndoPlugin(),   // a constructor param, so it can be passed below
+) : MviViewModel<EditViewState, EditIntent, NoEffect>(
+    dispatcherProvider,
+    pluginDependencies,
+    listOf(undoPlugin),
+),
+    HasUndoPlugin {
+
+    override suspend fun handleIntent(intent: EditIntent) = when (intent) {
+        EditIntent.Undo -> updateState { copy(text = undo.previous()) }  // <- your accessor
+        // ...
+    }
+}
+```
+
+That's it. Your plugin gets the same hooks, the same `onCreate` dependencies, and the same
+`intent -> state` visibility as `LoadingPlugin`.
+
+A full worked example, written from outside the library, is in
+[CustomPluginTest.kt](app/src/test/java/com/example/mvi/CustomPluginTest.kt).
+
+### The one difference from a built-in
+
+The base class can't construct your plugin for you, so **you pass it explicitly** in
+Step 4. The built-in four are installed from the marker alone:
+
+```kotlin
+internal val _loadingPlugin = if (this is HasLoadingPlugin) LoadingPluginImpl() else null
+```
+
+Getting that auto-installation is the only reason to edit `:mvi-core` — add the marker to
+`PluginMarkers.kt`, the accessor to `PluginAccessors.kt`, and the install line plus
+`plugins` entry in `MviViewModel`. Worth it for a concern *every* module shares, and not
+otherwise: it costs a change to the base class and makes `:mvi-core` depend on whatever
+your plugin depends on.
 
 ## Running it
 
@@ -407,7 +486,8 @@ and retry. Tap a row for `NavigationPlugin`. Watch Logcat's `Analytics` tag for
 ./gradlew test
 ```
 
-30 JVM unit tests, no emulator: 17 base, 7 plugins standalone, 6 full screen.
+34 JVM unit tests, no emulator: 17 base, 7 plugins standalone, 6 full screen, 4 for
+adding a plugin from outside the library.
 
 ## Not included
 

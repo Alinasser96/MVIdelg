@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import kotlin.reflect.KClass
 
 /**
  * Core MVI ViewModel.
@@ -135,6 +136,21 @@ abstract class MviViewModel<T : ViewState, I : Intent, E : Effect>(
     abstract fun initialState(): T
 
     abstract suspend fun handleIntent(intent: I)
+
+    /**
+     * Finds an installed plugin by type, or null.
+     *
+     * This is what lets code *outside* `:mvi-core` reproduce the marker + accessor pattern
+     * the four built-in plugins use. The `_loadingPlugin`-style fields are `internal`, so
+     * without this a consumer module could pass a plugin through [additionalPlugins] but
+     * never look it back up — leaving it to hold the reference by hand and giving up the
+     * compile-time scoping that makes the built-ins pleasant.
+     *
+     * Prefer the reified `requirePlugin()` extension at the call site.
+     */
+    @Suppress("UNCHECKED_CAST")
+    fun <P : MVIPlugin> pluginOrNull(type: KClass<P>): P? =
+        plugins.firstOrNull { type.isInstance(it) } as P?
 
     /** The single entry point from the UI. Never suspends, never drops an intent. */
     fun processIntent(intent: I) {

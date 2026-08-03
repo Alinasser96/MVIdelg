@@ -33,3 +33,29 @@ val HasLoggingPlugin.logging: LoggingPluginImpl
 fun HasLoggingPlugin.configureLogging(screenId: String) {
     logging.configure(screenId)
 }
+
+/**
+ * Looks up a plugin you supplied through `additionalPlugins`.
+ *
+ * Write the same marker + accessor pair the built-in four use, from any module:
+ *
+ * ```
+ * interface HasPaginationPlugin
+ *
+ * val HasPaginationPlugin.pagination: PaginationPlugin
+ *     get() = (this as MviViewModel<*, *, *>).requirePlugin()
+ * ```
+ *
+ * The only difference from a built-in is that the base cannot construct your plugin for
+ * you, so the ViewModel also passes it to `additionalPlugins`.
+ *
+ * @throws IllegalStateException if the plugin was never installed — which for a
+ *   marker-backed accessor means the marker and the `additionalPlugins` entry disagree.
+ */
+inline fun <reified P : MVIPlugin> MviViewModel<*, *, *>.requirePlugin(): P =
+    pluginOrNull(P::class)
+        ?: error("${P::class.simpleName} is not installed. Pass it in additionalPlugins.")
+
+/** Non-throwing variant, for a plugin that is genuinely optional. */
+inline fun <reified P : MVIPlugin> MviViewModel<*, *, *>.pluginOrNull(): P? =
+    pluginOrNull(P::class)
