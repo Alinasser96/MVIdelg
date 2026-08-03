@@ -1,0 +1,14 @@
+*.iml
+.gradle/
+build/
+/captures
+.externalNativeBuild
+.cxx
+
+# Machine-specific: contains the absolute path to your Android SDK.
+local.properties
+
+# IDE settings are per-developer; a public blueprint should not ship them.
+.idea/
+
+.DS_Store
