@@ -17,6 +17,50 @@ lines of ordinary Kotlin you are meant to read, disagree with, and adapt.
 
 ---
 
+## Architecture at a glance
+
+```mermaid
+flowchart TB
+    subgraph L1["UI · :app"]
+        SCR["Screen composable<br/><i>stateless · previewable</i>"]
+        RTE["Route composable<br/><i>owns the ViewModel</i>"]
+    end
+
+    subgraph L2["Feature · :app"]
+        FVM["Feature ViewModel<br/><i>MviViewModel + Has*Plugin markers</i>"]
+        REPO["Repository<br/><i>interface + fake</i>"]
+    end
+
+    subgraph L3["Blueprint · :mvi-core"]
+        BASE["MviViewModel base<br/><i>intent Channel · StateFlow · SharedFlow</i>"]
+        PLUG["Installed plugins<br/><i>Loading · Error · Navigation · Logging</i>"]
+        DEPS["MviPluginDependencies<br/><i>navigator · analytics · dispatchers</i>"]
+    end
+
+    subgraph L4["Navigation"]
+        NAVR["Navigator<br/><i>NavCommand stream</i>"]
+        HOST["AppNavigation<br/><i>the only androidx.navigation import</i>"]
+    end
+
+    SCR -->|"intent"| RTE
+    RTE -->|"state · isLoading · error"| SCR
+    RTE -->|"processIntent"| FVM
+    FVM -->|"viewState · effect"| RTE
+    FVM -->|"suspend calls"| REPO
+    FVM -.->|"extends"| BASE
+    DEPS -->|"onCreate"| PLUG
+    BASE -->|"installs by marker"| PLUG
+    PLUG -->|"isLoading · error"| RTE
+    PLUG -->|"NavCommand"| NAVR
+    NAVR -->|"collected once"| HOST
+```
+
+The two rules the diagram encodes: a feature ViewModel talks to its repository and to its
+installed plugins, and to nothing else. Navigation leaves through the plugin as a value,
+so no ViewModel ever holds a `NavHostController`.
+
+---
+
 ## The base owns the loop
 
 `MviViewModel<T : ViewState, I : Intent, E : Effect>` holds the intent channel, the state
@@ -71,6 +115,27 @@ val HasLoadingPlugin.loading: LoadingPluginImpl
     get() = (this as MviViewModel<*, *, *>)._loadingPlugin ?: error("...")
 ```
 
+Those two halves — the install check and the accessor — hang off the same marker:
+
+```mermaid
+graph LR
+    VM["CheckoutViewModel"]
+    MK["HasLoadingPlugin<br/><i>marker interface</i>"]
+    BS["MviViewModel base<br/><i>if this is HasLoadingPlugin</i>"]
+    IMPL["LoadingPluginImpl<br/><i>isLoading · withLoading</i>"]
+    ACC["val HasLoadingPlugin.loading<br/><i>extension property</i>"]
+
+    VM ==>|"1 · implements"| MK
+    MK -->|"2 · detected at construction"| BS
+    BS ==>|"3 · installs"| IMPL
+    MK -->|"4 · brings into scope"| ACC
+    ACC -->|"5 · resolves to"| IMPL
+    IMPL ==>|"6 · loading.withLoading"| VM
+```
+
+Declaring the marker is the only step you write. Steps 2 to 5 are the mechanism, and step
+6 is what you get back.
+
 That pairing is the part worth copying. A screen writes one word on its class declaration:
 
 ```kotlin
@@ -102,12 +167,12 @@ feature can forget to clear them.
 ```mermaid
 flowchart TB
     UI["Composable"]
-    PI["processIntent(intent)"]
+    PI["processIntent"]
     CH["intentChannel<br/><i>UNLIMITED, serialized</i>"]
-    HOOK["plugins.any { onIntent(it) }"]
-    HI["handleIntent(intent)<br/><i>suspend</i>"]
-    US["updateState { }"]
-    EE["emitEffect()"]
+    HOOK["plugin onIntent hook<br/><i>first look at every intent</i>"]
+    HI["handleIntent<br/><i>suspend</i>"]
+    US["updateState reducer"]
+    EE["emitEffect"]
     VS["viewState: StateFlow"]
     EF["effect: SharedFlow"]
     PL["Installed plugins<br/>loading · errors · navigation · logging"]
@@ -124,6 +189,41 @@ flowchart TB
 
 Plugins get **first look** at every intent. Any plugin returning `true` from `onIntent`
 consumes it, and the feature's `handleIntent` never sees it.
+
+### One intent, end to end
+
+A `Load` on the sample's list screen, showing exactly who touches what:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UI as Composable
+    participant VM as MviViewModel
+    participant LP as LoadingPlugin
+    participant EP as ErrorPlugin
+    participant R as Repository
+
+    UI->>VM: processIntent(Load)
+    Note over VM: queued on intentChannel,<br/>handled one at a time
+    VM->>LP: onIntent(Load)
+    LP-->>VM: false, not consumed
+    VM->>VM: handleIntent(Load)
+    VM->>LP: withLoading starts
+    LP-->>UI: isLoading = true
+    VM->>EP: runCatchingError
+    EP->>R: users()
+    R-->>EP: list of User
+    EP-->>VM: value, error cleared
+    VM->>VM: updateState copy(users)
+    VM-->>UI: viewState
+    VM->>LP: withLoading finally
+    LP-->>UI: isLoading = false
+```
+
+The screen collects three streams — `viewState`, `loading.isLoading`, `errors.error` — and
+only the first belongs to the feature. Swap the repository call for one that throws and
+nothing above changes shape: `runCatchingError` returns null, `withLoading`'s `finally`
+still clears the spinner, and the error surfaces on `errors.error`.
 
 ---
 
@@ -247,10 +347,17 @@ at the cost of the `this is HasXxxPlugin` check and the non-null accessors.
 
 ## The rules worth arguing about
 
-**State, effect, or plugin?** Does it belong to *this screen only*? → `ViewState`. Is it a
-one-shot UI event, like a snackbar? → `Effect`. Does every screen need it — loading,
-errors, navigation, analytics? → a plugin. Navigation in particular is a plugin here, not
-an effect.
+**State, effect, or plugin?** Navigation in particular is a plugin here, not an effect.
+
+```mermaid
+graph TD
+    Q["Something new to add"]
+    Q --> Q1{"Would more than<br/>one screen need it?"}
+    Q1 -->|"yes"| P["Plugin<br/><i>loading · errors · navigation · analytics</i>"]
+    Q1 -->|"no"| Q2{"If the screen rotated now,<br/>should it happen again?"}
+    Q2 -->|"yes"| S["ViewState field<br/><i>rendered every recomposition</i>"]
+    Q2 -->|"no"| E["Effect<br/><i>consumed exactly once</i>"]
+```
 
 **Intents are named after what happened, not what to do.** `UserClicked`, not `OpenUser`.
 The UI reports; the ViewModel decides.
