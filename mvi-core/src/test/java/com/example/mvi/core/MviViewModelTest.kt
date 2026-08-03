@@ -1,149 +1,269 @@
 package com.example.mvi.core
 
 import app.cash.turbine.test
+import com.example.mvi.core.navigation.ChannelNavigator
+import com.example.mvi.core.navigation.NavCommand
+import com.example.mvi.core.plugins.HasErrorPlugin
+import com.example.mvi.core.plugins.HasLoadingPlugin
+import com.example.mvi.core.plugins.HasLoggingPlugin
+import com.example.mvi.core.plugins.HasNavigationPlugin
+import com.example.mvi.core.plugins.MviPluginDependencies
+import com.example.mvi.core.plugins.configureLogging
+import com.example.mvi.core.plugins.errors
+import com.example.mvi.core.plugins.loading
+import com.example.mvi.core.plugins.logging
+import com.example.mvi.core.plugins.navigation
+import com.example.mvi.core.helpers.DispatcherProvider
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 
 /**
- * What testing an MVI screen looks like: send intents, assert on state and effects.
- * No Robolectric, no Android, no mocking framework.
+ * The base class: intents in, state and effects out, plugins installed by marker.
  */
 class MviViewModelTest {
 
     @get:Rule
     val mainDispatcherRule = MainDispatcherRule()
 
+    private val navigator = ChannelNavigator()
+    private val analytics = RecordingAnalyticsLogger()
+
+    private fun dependencies(): MviPluginDependencies =
+        testPluginDependencies(mainDispatcherRule.testDispatcher, navigator, analytics)
+
+    private fun dispatchers(): DispatcherProvider =
+        TestDispatcherProvider(mainDispatcherRule.testDispatcher)
+
+    private fun viewModel() = FullyLoadedViewModel(dispatchers(), dependencies())
+
     @Test
     fun `intents are reduced into state in order`() = runTest {
-        val viewModel = CounterViewModel()
+        val viewModel = viewModel()
+        viewModel.viewState.value // touch: lazy init starts the intent collector
 
-        viewModel.onIntent(CounterIntent.Increment)
-        viewModel.onIntent(CounterIntent.Increment)
-        viewModel.onIntent(CounterIntent.Increment)
+        viewModel.processIntent(CounterIntent.Increment)
+        viewModel.processIntent(CounterIntent.Increment)
+        viewModel.processIntent(CounterIntent.Double)
         advanceUntilIdle()
 
-        assertEquals(3, viewModel.currentState.count)
+        // Order matters: (0+1+1)*2 = 4, not 0+1+(1*2).
+        assertEquals(4, viewModel.viewState.value.count)
     }
 
     @Test
-    fun `intents sent before anyone collects are not lost`() = runTest {
-        val viewModel = CounterViewModel()
+    fun `intents sent before the state is observed are not lost`() = runTest {
+        val viewModel = viewModel()
 
-        // Queued while the intent channel has no collector yet - the Channel buffers them.
-        viewModel.onIntent(CounterIntent.Increment)
+        // Nothing has touched viewState, so the collector has not started yet. The
+        // UNLIMITED channel parks these until it does.
+        viewModel.processIntent(CounterIntent.Increment)
+        viewModel.processIntent(CounterIntent.Increment)
+
+        viewModel.viewState.value
         advanceUntilIdle()
 
-        assertEquals(1, viewModel.currentState.count)
+        assertEquals(2, viewModel.viewState.value.count)
     }
 
     @Test
-    fun `effects are delivered once`() = runTest {
-        val viewModel = CounterViewModel()
+    fun `initialState is used until something reduces it`() = runTest {
+        val viewModel = viewModel()
+
+        assertEquals(CounterState(), viewModel.viewState.value)
+    }
+
+    @Test
+    fun `effects are emitted to a collector`() = runTest {
+        val viewModel = viewModel()
+        viewModel.viewState.value
 
         viewModel.effect.test {
-            viewModel.onIntent(CounterIntent.Celebrate)
+            viewModel.processIntent(CounterIntent.Celebrate)
             advanceUntilIdle()
 
-            assertEquals(CounterEffect.Toast("100 reached"), awaitItem())
-            expectNoEvents()
+            assertEquals(CounterEffect.Toast("nice"), awaitItem())
         }
     }
 
     @Test
-    fun `onIntentReceived sees every intent - the logging seam`() = runTest {
-        val viewModel = CounterViewModel()
+    fun `a plugin is installed only when its marker is implemented`() = runTest {
+        val loaded = viewModel()
 
-        viewModel.onIntent(CounterIntent.Increment)
-        viewModel.onIntent(CounterIntent.Celebrate)
-        advanceUntilIdle()
+        // Declared markers -> the accessors resolve and the plugins are live.
+        assertFalse(loaded.loading.isLoading.value)
+        assertNull(loaded.errors.error.value)
 
-        assertEquals(
-            listOf(CounterIntent.Increment, CounterIntent.Celebrate),
-            viewModel.observedIntents,
-        )
+        // No markers -> nothing installed. Referencing `bare.loading` would not even
+        // compile, so the strongest runtime check available is the marker itself.
+        val bare: MviViewModel<*, *, *> = BareViewModel(dispatchers(), dependencies())
+        assertFalse(bare is HasLoadingPlugin)
+        assertFalse(bare is HasErrorPlugin)
+        assertFalse(bare is HasNavigationPlugin)
+        assertFalse(bare is HasLoggingPlugin)
     }
 
     @Test
-    fun `a throwing intent is routed to onIntentError and the ViewModel stays alive`() = runTest {
-        val viewModel = CounterViewModel()
+    fun `the loading plugin drives the spinner across a suspending intent`() = runTest {
+        val viewModel = viewModel()
+        viewModel.viewState.value
 
-        viewModel.onIntent(CounterIntent.Explode)
-        advanceUntilIdle()
-        assertEquals("boom", viewModel.currentState.lastError)
+        viewModel.loading.isLoading.test {
+            assertFalse(awaitItem())
 
-        // The real regression this guards: without the try/catch in the base class the
-        // throw would cancel viewModelScope and every later intent would be ignored.
-        viewModel.onIntent(CounterIntent.Increment)
-        advanceUntilIdle()
-        assertEquals(1, viewModel.currentState.count)
+            viewModel.processIntent(CounterIntent.LoadSlowly)
+            // Step, don't jump: advancing straight to idle would let StateFlow conflate
+            // true -> false and the spinner would never be observed at all.
+            advanceTimeBy(1)
+            assertTrue(awaitItem())
+
+            advanceUntilIdle()
+            assertFalse(awaitItem())
+        }
+        assertEquals(99, viewModel.viewState.value.count)
     }
 
     @Test
-    fun `state exposes distinct values only`() = runTest {
-        val viewModel = CounterViewModel()
+    fun `a failing intent lands in the error plugin, not in the screen state`() = runTest {
+        val viewModel = viewModel()
+        viewModel.viewState.value
 
-        viewModel.state.test {
-            assertEquals(CounterState(), awaitItem())
+        viewModel.processIntent(CounterIntent.Explode)
+        advanceUntilIdle()
 
-            viewModel.onIntent(CounterIntent.Increment)
+        assertEquals("boom", viewModel.errors.error.value?.message)
+        // The screen's own state never grew an error field.
+        assertEquals(CounterState(), viewModel.viewState.value)
+    }
+
+    @Test
+    fun `navigation goes through the plugin, never through the ViewModel`() = runTest {
+        val viewModel = viewModel()
+        viewModel.viewState.value
+
+        navigator.commands.test {
+            viewModel.processIntent(CounterIntent.GoHome)
             advanceUntilIdle()
-            assertEquals(1, awaitItem().count)
 
-            // Reducing to an equal value emits nothing: StateFlow conflates duplicates.
-            viewModel.onIntent(CounterIntent.NoOp)
-            advanceUntilIdle()
-            expectNoEvents()
+            assertEquals(NavCommand.To(TestDestination("home")), awaitItem())
         }
     }
 
     @Test
-    fun `initial state is the one passed to the base class`() = runTest {
-        val viewModel = CounterViewModel()
+    fun `analytics are logged through the logging plugin`() = runTest {
+        val viewModel = viewModel()
+        viewModel.viewState.value
 
-        assertEquals(0, viewModel.currentState.count)
-        assertNull(viewModel.currentState.lastError)
+        viewModel.processIntent(CounterIntent.Increment)
+        advanceUntilIdle()
+
+        assertEquals(1, analytics.events.size)
+        assertEquals("counter", analytics.events.first().screenId)
+    }
+
+    @Test
+    fun `plugins are not created until the state is observed`() = runTest {
+        val viewModel = viewModel()
+
+        // NavigationPluginImpl gets its Navigator in onCreate, which the lazy viewState
+        // triggers. Navigating before anything observes the screen would throw - worth
+        // knowing, because it makes "navigate straight from init" a trap.
+        val threw = runCatching { viewModel.navigation.navigateTo(TestDestination("home")) }.isFailure
+        assertTrue(threw)
+
+        viewModel.viewState.value
+        viewModel.navigation.navigateTo(TestDestination("home"))
+    }
+
+    @Test
+    fun `onCleared closes the intent channel`() = runTest {
+        val viewModel = viewModel()
+        viewModel.viewState.value
+        advanceUntilIdle()
+
+        viewModel.clear()
+        viewModel.processIntent(CounterIntent.Increment)
+        advanceUntilIdle()
+
+        assertEquals(0, viewModel.viewState.value.count)
     }
 }
 
-private data class CounterState(
-    val count: Int = 0,
-    val lastError: String? = null,
-) : MviState
+// ---- Test doubles ----
 
-private sealed interface CounterIntent : MviIntent {
+private data class CounterState(val count: Int = 0) : ViewState
+
+private sealed interface CounterIntent : Intent {
     data object Increment : CounterIntent
-    data object NoOp : CounterIntent
+    data object Double : CounterIntent
     data object Celebrate : CounterIntent
+    data object LoadSlowly : CounterIntent
     data object Explode : CounterIntent
+    data object GoHome : CounterIntent
 }
 
-private sealed interface CounterEffect : MviEffect {
+private sealed interface CounterEffect : Effect {
     data class Toast(val message: String) : CounterEffect
 }
 
-private class CounterViewModel :
-    MviViewModel<CounterIntent, CounterState, CounterEffect>(CounterState()) {
+/** A screen that opts into all four plugins. */
+private class FullyLoadedViewModel(
+    dispatcherProvider: DispatcherProvider,
+    pluginDependencies: MviPluginDependencies,
+) : MviViewModel<CounterState, CounterIntent, CounterEffect>(dispatcherProvider, pluginDependencies),
+    HasLoadingPlugin,
+    HasErrorPlugin,
+    HasNavigationPlugin,
+    HasLoggingPlugin {
 
-    val observedIntents = mutableListOf<CounterIntent>()
+    init {
+        configureLogging("counter")
+    }
+
+    override fun initialState() = CounterState()
 
     override suspend fun handleIntent(intent: CounterIntent) {
         when (intent) {
-            CounterIntent.Increment -> updateState { copy(count = count + 1) }
-            CounterIntent.NoOp -> updateState { this }
-            CounterIntent.Celebrate -> sendEffect(CounterEffect.Toast("100 reached"))
-            CounterIntent.Explode -> error("boom")
+            CounterIntent.Increment -> {
+                updateState { copy(count = count + 1) }
+                logging.logButtonEvent("increment")
+            }
+
+            CounterIntent.Double -> updateState { copy(count = count * 2) }
+
+            CounterIntent.Celebrate -> emitEffect(CounterEffect.Toast("nice"))
+
+            // handleIntent is suspend, so async work needs no launch.
+            CounterIntent.LoadSlowly -> loading.withLoading {
+                delay(100)
+                updateState { copy(count = 99) }
+            }
+
+            CounterIntent.Explode -> errors.runCatchingError { error("boom") }
+
+            CounterIntent.GoHome -> navigation.navigateTo(TestDestination("home"))
         }
     }
 
-    override fun onIntentReceived(intent: CounterIntent) {
-        observedIntents += intent
-    }
+    fun clear() = onCleared()
+}
 
-    override fun onIntentError(intent: CounterIntent, error: Throwable) {
-        updateState { copy(lastError = error.message) }
+/** A screen that opts into nothing. No plugin is installed for it. */
+private class BareViewModel(
+    dispatcherProvider: DispatcherProvider,
+    pluginDependencies: MviPluginDependencies,
+) : MviViewModel<CounterState, CounterIntent, NoEffect>(dispatcherProvider, pluginDependencies) {
+
+    override fun initialState() = CounterState()
+
+    override suspend fun handleIntent(intent: CounterIntent) {
+        updateState { copy(count = count + 1) }
     }
 }

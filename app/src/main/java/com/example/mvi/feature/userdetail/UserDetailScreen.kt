@@ -1,6 +1,5 @@
 package com.example.mvi.feature.userdetail
 
-import android.content.Intent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,53 +13,54 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.example.mvi.core.compose.CollectEffects
+import com.example.mvi.core.error.OperationError
+import com.example.mvi.core.plugins.errors
+import com.example.mvi.core.plugins.loading
 import com.example.mvi.data.User
 import com.example.mvi.ui.theme.MviTheme
 
 @Composable
 fun UserDetailRoute(
     userId: Int,
-    onBack: () -> Unit,
     modifier: Modifier = Modifier,
     viewModel: UserDetailViewModel = viewModel(
-        // Keyed by id so navigating to a different user builds a different ViewModel
-        // instead of reusing the previous one's already-loaded state.
+        // Keyed by id, so opening a different user builds a different ViewModel rather
+        // than reusing the previous one's already-loaded state.
         key = "user-$userId",
         factory = UserDetailViewModel.factory(userId),
     ),
 ) {
-    val state by viewModel.state.collectAsStateWithLifecycle()
-    val context = LocalContext.current
+    val state by viewModel.viewState.collectAsStateWithLifecycle()
+    val isLoading by viewModel.loading.isLoading.collectAsStateWithLifecycle()
+    val error by viewModel.errors.error.collectAsStateWithLifecycle()
 
-    CollectEffects(viewModel.effect) { effect ->
-        when (effect) {
-            UserDetailEffect.NavigateBack -> onBack()
-            is UserDetailEffect.Share -> {
-                val share = Intent(Intent.ACTION_SEND).apply {
-                    type = "text/plain"
-                    putExtra(Intent.EXTRA_TEXT, effect.text)
-                }
-                context.startActivity(Intent.createChooser(share, null))
-            }
-        }
-    }
+    LaunchedEffect(userId) { viewModel.processIntent(UserDetailIntent.Load) }
 
-    UserDetailScreen(state = state, onIntent = viewModel::onIntent, modifier = modifier)
+    // No CollectEffects here: this screen's Effect type is NoEffect, and back navigation
+    // goes through the NavigationPlugin rather than through the UI.
+    UserDetailScreen(
+        state = state,
+        isLoading = isLoading,
+        error = error,
+        onIntent = viewModel::processIntent,
+        modifier = modifier,
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun UserDetailScreen(
-    state: UserDetailState,
+    state: UserDetailViewState,
+    isLoading: Boolean,
+    error: OperationError?,
     onIntent: (UserDetailIntent) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -74,12 +74,6 @@ fun UserDetailScreen(
                         Text("Back")
                     }
                 },
-                actions = {
-                    TextButton(
-                        onClick = { onIntent(UserDetailIntent.ShareClicked) },
-                        enabled = state.user != null,
-                    ) { Text("Share") }
-                },
             )
         },
     ) { padding ->
@@ -90,17 +84,11 @@ fun UserDetailScreen(
             contentAlignment = Alignment.Center,
         ) {
             when {
-                // Order matters: a stale user is still shown while a retry is in flight,
-                // because AsyncDelegate carried the previous value into Loading.
                 state.user != null -> UserCard(state.user)
-                state.isLoading -> CircularProgressIndicator()
-                state.errorMessage != null -> Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Text(state.errorMessage)
-                    TextButton(onClick = { onIntent(UserDetailIntent.RetryClicked) }) {
-                        Text("Retry")
-                    }
+                isLoading -> CircularProgressIndicator()
+                error != null -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(error.message)
+                    TextButton(onClick = { onIntent(UserDetailIntent.Retry) }) { Text("Retry") }
                 }
             }
         }
@@ -129,9 +117,11 @@ private fun UserCard(user: User) {
 private fun UserDetailPreview() {
     MviTheme {
         UserDetailScreen(
-            state = UserDetailState(
+            state = UserDetailViewState(
                 user = User(1, "Hana Khalil", "@hana1", "Designer", "Designer #1. Joined in 2019."),
             ),
+            isLoading = false,
+            error = null,
             onIntent = {},
         )
     }

@@ -2,9 +2,18 @@ package com.example.mvi.feature.userlist
 
 import app.cash.turbine.test
 import com.example.mvi.MainDispatcherRule
+import com.example.mvi.core.analytics.AnalyticsEvent
+import com.example.mvi.core.analytics.AnalyticsLogger
+import com.example.mvi.core.helpers.DispatcherProvider
+import com.example.mvi.core.navigation.ChannelNavigator
+import com.example.mvi.core.navigation.NavCommand
+import com.example.mvi.core.plugins.MviPluginDependencies
+import com.example.mvi.core.plugins.errors
+import com.example.mvi.core.plugins.loading
 import com.example.mvi.data.User
 import com.example.mvi.data.UserRepository
-import kotlinx.coroutines.test.advanceTimeBy
+import com.example.mvi.navigation.AppDestination
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -15,155 +24,149 @@ import org.junit.Rule
 import org.junit.Test
 
 /**
- * Testing a whole screen: send intents, assert on state and effects.
+ * Testing a whole screen: send intents, assert on state, plugins, and effects.
  *
- * No Robolectric, no Compose test rule, no mocking library, and no `Thread.sleep` — the
- * debounce is skipped with virtual time. The screen's entire behaviour is reachable
- * through the sealed intent type, so these tests can be written straight off the contract.
+ * No Robolectric, no Compose test rule, no mocking library. Loading and errors are
+ * asserted on the *plugins*, not on the screen's state — which is exactly where they live.
  */
 class UserListViewModelTest {
 
     @get:Rule
     val mainDispatcherRule = MainDispatcherRule()
 
+    private val navigator = ChannelNavigator()
+    private val analytics = RecordingAnalyticsLogger()
+
+    private fun viewModel(repository: UserRepository) = UserListViewModel(
+        repository = repository,
+        dispatcherProvider = TestDispatchers(mainDispatcherRule.testDispatcher),
+        pluginDependencies = MviPluginDependencies(
+            navigator = navigator,
+            analyticsLogger = analytics,
+            dispatcherProvider = TestDispatchers(mainDispatcherRule.testDispatcher),
+        ),
+    )
+
     @Test
-    fun `the first page loads on init`() = runTest {
-        val viewModel = UserListViewModel(FakeUserRepository(userCount = 50))
+    fun `Load fills the list and clears the spinner`() = runTest {
+        val viewModel = viewModel(FakeUserRepository(userCount = 3))
+        viewModel.viewState.value // lazy init: start the intent collector
+
+        viewModel.processIntent(UserListIntent.Load)
         advanceUntilIdle()
 
-        val state = viewModel.currentState
-        assertEquals(UserListViewModel.PAGE_SIZE, state.users.size)
-        assertFalse(state.isRefreshing)
-        assertNull(state.errorMessage)
+        assertEquals(3, viewModel.viewState.value.users.size)
+        assertFalse(viewModel.loading.isLoading.value)
+        assertNull(viewModel.errors.error.value)
     }
 
     @Test
-    fun `LoadNextPage appends the next page`() = runTest {
-        val viewModel = UserListViewModel(FakeUserRepository(userCount = 50))
+    fun `a failure lands in the error plugin and the spinner still clears`() = runTest {
+        val repository = FakeUserRepository(userCount = 3, failing = true)
+        val viewModel = viewModel(repository)
+        viewModel.viewState.value
+
+        viewModel.processIntent(UserListIntent.Load)
         advanceUntilIdle()
 
-        viewModel.onIntent(UserListIntent.LoadNextPage)
-        advanceUntilIdle()
-
-        assertEquals(UserListViewModel.PAGE_SIZE * 2, viewModel.currentState.users.size)
+        assertEquals("offline", viewModel.errors.error.value?.message)
+        // withLoading's finally is what guarantees this on the failure path.
+        assertFalse(viewModel.loading.isLoading.value)
+        assertTrue(viewModel.viewState.value.users.isEmpty())
     }
 
     @Test
-    fun `the end of the list is reported once every page is in`() = runTest {
-        val viewModel = UserListViewModel(FakeUserRepository(userCount = 25))
+    fun `Retry clears the previous error and reloads`() = runTest {
+        val repository = FakeUserRepository(userCount = 3, failing = true)
+        val viewModel = viewModel(repository)
+        viewModel.viewState.value
+
+        viewModel.processIntent(UserListIntent.Load)
         advanceUntilIdle()
-
-        viewModel.onIntent(UserListIntent.LoadNextPage)
-        advanceUntilIdle()
-
-        assertEquals(25, viewModel.currentState.users.size)
-        assertTrue(viewModel.currentState.endReached)
-    }
-
-    @Test
-    fun `typing updates the field immediately but searches only once`() = runTest {
-        val repository = FakeUserRepository(userCount = 50)
-        val viewModel = UserListViewModel(repository)
-        advanceUntilIdle()
-        val queriesBefore = repository.queries.size
-
-        viewModel.onIntent(UserListIntent.QueryChanged("H"))
-        viewModel.onIntent(UserListIntent.QueryChanged("Ha"))
-        viewModel.onIntent(UserListIntent.QueryChanged("Han"))
-        advanceUntilIdle()
-
-        // The text field is already up to date...
-        assertEquals("Han", viewModel.currentState.query)
-        // ...and exactly one request went out, for the settled query.
-        assertEquals(queriesBefore + 1, repository.queries.size)
-        assertEquals("Han", repository.queries.last())
-    }
-
-    @Test
-    fun `a new query restarts paging from the first page`() = runTest {
-        val repository = FakeUserRepository(userCount = 50)
-        val viewModel = UserListViewModel(repository)
-        advanceUntilIdle()
-        viewModel.onIntent(UserListIntent.LoadNextPage)
-        advanceUntilIdle()
-        assertEquals(40, viewModel.currentState.users.size)
-
-        viewModel.onIntent(UserListIntent.QueryChanged("Name"))
-        advanceTimeBy(400)
-        advanceUntilIdle()
-
-        assertEquals(UserListViewModel.PAGE_SIZE, viewModel.currentState.users.size)
-    }
-
-    @Test
-    fun `tapping a user emits a navigation effect and does not touch state`() = runTest {
-        val viewModel = UserListViewModel(FakeUserRepository(userCount = 50))
-        advanceUntilIdle()
-        val stateBefore = viewModel.currentState
-
-        viewModel.effect.test {
-            viewModel.onIntent(UserListIntent.UserClicked(7))
-            advanceUntilIdle()
-
-            assertEquals(UserListEffect.OpenUser(7), awaitItem())
-        }
-        assertEquals(stateBefore, viewModel.currentState)
-    }
-
-    @Test
-    fun `a failed first load becomes a blocking error that retry clears`() = runTest {
-        val repository = FakeUserRepository(userCount = 50, failing = true)
-        val viewModel = UserListViewModel(repository)
-        advanceUntilIdle()
-
-        assertTrue(viewModel.currentState.isBlockingError)
-        assertEquals("offline", viewModel.currentState.errorMessage)
+        assertEquals("offline", viewModel.errors.error.value?.message)
 
         repository.failing = false
-        viewModel.onIntent(UserListIntent.RetryClicked)
+        viewModel.processIntent(UserListIntent.Retry)
         advanceUntilIdle()
 
-        assertNull(viewModel.currentState.errorMessage)
-        assertEquals(UserListViewModel.PAGE_SIZE, viewModel.currentState.users.size)
+        assertNull(viewModel.errors.error.value)
+        assertEquals(3, viewModel.viewState.value.users.size)
     }
 
     @Test
-    fun `a failed load-more keeps the list and asks for a snackbar instead`() = runTest {
-        val repository = FakeUserRepository(userCount = 50)
-        val viewModel = UserListViewModel(repository)
-        advanceUntilIdle()
+    fun `tapping a user navigates through the plugin, not through state or an effect`() = runTest {
+        val viewModel = viewModel(FakeUserRepository(userCount = 3))
+        viewModel.viewState.value
+        val stateBefore = viewModel.viewState.value
 
-        viewModel.effect.test {
-            repository.failing = true
-            viewModel.onIntent(UserListIntent.LoadNextPage)
+        navigator.commands.test {
+            viewModel.processIntent(UserListIntent.UserClicked(7))
             advanceUntilIdle()
 
-            assertEquals(UserListEffect.ShowMessage("offline"), awaitItem())
+            assertEquals(NavCommand.To(AppDestination.UserDetail(7)), awaitItem())
         }
+        assertEquals(stateBefore, viewModel.viewState.value)
+    }
 
-        // The pages already on screen survived, so this is not a blocking error.
-        assertEquals(UserListViewModel.PAGE_SIZE, viewModel.currentState.users.size)
-        assertFalse(viewModel.currentState.isBlockingError)
+    @Test
+    fun `intents are logged through the logging plugin`() = runTest {
+        val viewModel = viewModel(FakeUserRepository(userCount = 3))
+        viewModel.viewState.value
+
+        viewModel.processIntent(UserListIntent.UserClicked(1))
+        advanceUntilIdle()
+
+        assertEquals(
+            AnalyticsEvent.Button("user_row", "user_list"),
+            analytics.events.single(),
+        )
+    }
+
+    @Test
+    fun `toggling failure updates state and announces it via an effect`() = runTest {
+        val viewModel = viewModel(FakeUserRepository(userCount = 3))
+        viewModel.viewState.value
+
+        viewModel.effect.test {
+            viewModel.processIntent(UserListIntent.SimulateFailureToggled(true))
+            advanceUntilIdle()
+
+            assertEquals(UserListEffect.ShowMessage("Next load will fail."), awaitItem())
+        }
+        assertTrue(viewModel.viewState.value.simulateFailure)
     }
 }
 
-/** Ten lines, no mocking framework — the payoff of depending on an interface. */
+// ---- Test doubles ----
+
+private class TestDispatchers(private val dispatcher: CoroutineDispatcher) : DispatcherProvider {
+    override val main: CoroutineDispatcher get() = dispatcher
+    override val io: CoroutineDispatcher get() = dispatcher
+    override val default: CoroutineDispatcher get() = dispatcher
+}
+
+private class RecordingAnalyticsLogger : AnalyticsLogger {
+    val events = mutableListOf<AnalyticsEvent>()
+    override suspend fun log(event: AnalyticsEvent) {
+        events += event
+    }
+}
+
+/** Five lines, no mocking framework — the payoff of depending on an interface. */
 private class FakeUserRepository(
     userCount: Int,
     var failing: Boolean = false,
 ) : UserRepository {
 
-    val queries = mutableListOf<String>()
-
     private val all = List(userCount) { User(it, "Name $it", "@user$it", "Engineer", "Bio $it") }
 
-    override suspend fun users(query: String, page: Int, pageSize: Int): List<User> {
-        queries += query
+    override suspend fun users(): List<User> {
         if (failing) throw IllegalStateException("offline")
-        return all.filter { it.name.contains(query, ignoreCase = true) }
-            .drop(page * pageSize)
-            .take(pageSize)
+        return all
     }
 
-    override suspend fun user(id: Int): User = all.first { it.id == id }
+    override suspend fun user(id: Int): User {
+        if (failing) throw IllegalStateException("offline")
+        return all.first { it.id == id }
+    }
 }

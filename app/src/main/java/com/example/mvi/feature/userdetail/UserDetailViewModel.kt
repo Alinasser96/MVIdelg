@@ -1,61 +1,68 @@
 package com.example.mvi.feature.userdetail
 
 import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.example.mvi.core.MviViewModel
-import com.example.mvi.core.delegate.AsyncDelegate
+import com.example.mvi.core.NoEffect
+import com.example.mvi.core.helpers.DispatcherProvider
+import com.example.mvi.core.plugins.HasErrorPlugin
+import com.example.mvi.core.plugins.HasLoadingPlugin
+import com.example.mvi.core.plugins.HasNavigationPlugin
+import com.example.mvi.core.plugins.MviPluginDependencies
+import com.example.mvi.core.plugins.errors
+import com.example.mvi.core.plugins.loading
+import com.example.mvi.core.plugins.navigation
 import com.example.mvi.data.UserRepository
 import com.example.mvi.di.ServiceLocator
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
 
 /**
- * The same three steps as [com.example.mvi.feature.userlist.UserListViewModel] — compose,
- * project, route — with a different delegate.
+ * A screen that opts into **three** plugins, not four.
  *
- * That is the payoff of composition: two screens with nothing in common behaviourally
- * still read identically, because neither of them inherited behaviour it did not ask for.
+ * There is no `HasLoggingPlugin` here, so no `LoggingPluginImpl` is constructed for this
+ * ViewModel and `logging` does not resolve inside this class at all — it is a compile
+ * error, not a null. That is the whole argument for markers over a fat base class: a
+ * screen carries exactly the capabilities it asked for, enforced by the compiler.
  */
 class UserDetailViewModel(
-    userId: Int,
-    repository: UserRepository,
-) : MviViewModel<UserDetailIntent, UserDetailState, UserDetailEffect>(UserDetailState()) {
+    private val userId: Int,
+    private val repository: UserRepository,
+    dispatcherProvider: DispatcherProvider,
+    pluginDependencies: MviPluginDependencies,
+) : MviViewModel<UserDetailViewState, UserDetailIntent, NoEffect>(
+    dispatcherProvider,
+    pluginDependencies,
+),
+    HasLoadingPlugin,
+    HasErrorPlugin,
+    HasNavigationPlugin {
 
-    private val user = AsyncDelegate(viewModelScope) { repository.user(userId) }
-
-    init {
-        user.state
-            .onEach { async ->
-                updateState {
-                    copy(
-                        user = async.valueOrNull,
-                        isLoading = async.isLoading,
-                        errorMessage = async.errorOrNull?.message,
-                    )
-                }
-            }
-            .launchIn(viewModelScope)
-
-        user.load()
-    }
+    override fun initialState() = UserDetailViewState()
 
     override suspend fun handleIntent(intent: UserDetailIntent) {
         when (intent) {
-            UserDetailIntent.RetryClicked -> user.retry()
-            UserDetailIntent.BackClicked -> sendEffect(UserDetailEffect.NavigateBack)
-            UserDetailIntent.ShareClicked -> {
-                // Reading currentState to build an effect is exactly what it is for.
-                val current = currentState.user ?: return
-                sendEffect(UserDetailEffect.Share("${current.name} (${current.handle})"))
-            }
+            UserDetailIntent.Load, UserDetailIntent.Retry -> loadUser()
+            UserDetailIntent.BackClicked -> navigation.navigateBack()
+        }
+    }
+
+    private suspend fun loadUser() {
+        loading.withLoading {
+            val user = errors.runCatchingError { repository.user(userId) } ?: return@withLoading
+            updateState { copy(user = user) }
         }
     }
 
     companion object {
         fun factory(userId: Int): ViewModelProvider.Factory = viewModelFactory {
-            initializer { UserDetailViewModel(userId, ServiceLocator.userRepository) }
+            initializer {
+                UserDetailViewModel(
+                    userId = userId,
+                    repository = ServiceLocator.userRepository,
+                    dispatcherProvider = ServiceLocator.dispatcherProvider,
+                    pluginDependencies = ServiceLocator.pluginDependencies,
+                )
+            }
         }
     }
 }

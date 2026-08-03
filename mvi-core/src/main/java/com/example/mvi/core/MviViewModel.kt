@@ -2,92 +2,150 @@ package com.example.mvi.core
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.mvi.core.effect.EffectEmitter
-import com.example.mvi.core.effect.EffectEmitterDelegate
-import com.example.mvi.core.intent.IntentReceiver
-import com.example.mvi.core.intent.IntentReceiverDelegate
-import com.example.mvi.core.state.StateStore
-import com.example.mvi.core.state.StateStoreDelegate
-import kotlinx.coroutines.CancellationException
+import com.example.mvi.core.helpers.DispatcherProvider
+import com.example.mvi.core.plugins.ErrorPluginImpl
+import com.example.mvi.core.plugins.HasErrorPlugin
+import com.example.mvi.core.plugins.HasLoadingPlugin
+import com.example.mvi.core.plugins.HasLoggingPlugin
+import com.example.mvi.core.plugins.HasNavigationPlugin
+import com.example.mvi.core.plugins.LoadingPluginImpl
+import com.example.mvi.core.plugins.LoggingPluginImpl
+import com.example.mvi.core.plugins.MVIPlugin
+import com.example.mvi.core.plugins.MviPluginDependencies
+import com.example.mvi.core.plugins.NavigationPluginImpl
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 
 /**
- * The base every screen's ViewModel extends.
+ * Core MVI ViewModel.
  *
- * **This class contains almost no code, and that is the point.** It does not *implement*
- * state holding, effect emitting or intent receiving — it *acquires* those three
- * capabilities from three independent delegates:
+ * The parent class owns the MVI loop outright — the intent channel, the state flow, the
+ * effect flow, and the reducer. There is no indirection to chase: `updateState`,
+ * `emitEffect` and `processIntent` are all right here.
  *
+ * **Plugins are automatically installed based on implemented interfaces.** Just implement
+ * a `HasXxxPlugin` interface to get the plugin functionality — the base checks
+ * `this is HasLoadingPlugin` at construction and installs accordingly. That is where the
+ * architecture's extensibility lives: capabilities are *installed*, never inherited as
+ * methods every screen carries.
+ *
+ * Intents are serialized through a channel — they are processed one at a time, in order.
+ * `handleIntent` is a suspend function, so async work can be called directly without
+ * `viewModelScope.launch`; the next intent simply waits its turn.
+ *
+ * Example:
  * ```
- * StateStore<S>     by StateStoreDelegate(initialState)
- * EffectEmitter<E>  by EffectEmitterDelegate()
- * IntentReceiver<I> by IntentReceiverDelegate()
+ * class MyViewModel(
+ *     dispatcherProvider: DispatcherProvider,
+ *     pluginDependencies: MviPluginDependencies,
+ * ) : MviViewModel<MyState, MyIntent, MyEffect>(dispatcherProvider, pluginDependencies),
+ *     HasLoadingPlugin,
+ *     HasErrorPlugin {
+ *
+ *     override fun initialState() = MyState()
+ *
+ *     override suspend fun handleIntent(intent: MyIntent) {
+ *         loading.withLoading {
+ *             val result = repository.fetch() // suspend call, no launch needed
+ *             updateState { copy(data = result) }
+ *         }
+ *     }
+ * }
  * ```
- *
- * Why delegation instead of just putting the three `MutableStateFlow`s in the base class:
- *
- * - **Each capability stays swappable.** A ViewModel that needs state restored across
- *   process death can pass a `SavedStateStoreDelegate` instead, with no change here.
- * - **Each capability is unit-testable on its own**, without constructing a ViewModel or
- *   touching the Android main looper.
- * - **The base cannot grow into a god object.** Anything new — pagination, search,
- *   polling, undo — becomes another delegate a *feature* composes (see the `delegate`
- *   package), not another method every screen in the app inherits whether it needs it
- *   or not. That is the rule this blueprint is built around: **the base gives you the
- *   MVI loop and nothing else; everything else is composed.**
- *
- * Subclasses implement exactly one function, [handleIntent].
- *
- * @param initialState what the screen shows before anything has loaded.
  */
-abstract class MviViewModel<I : MviIntent, S : MviState, E : MviEffect>(
-    initialState: S,
-) : ViewModel(),
-    StateStore<S> by StateStoreDelegate(initialState),
-    EffectEmitter<E> by EffectEmitterDelegate(),
-    IntentReceiver<I> by IntentReceiverDelegate() {
+abstract class MviViewModel<T : ViewState, I : Intent, E : Effect>(
+    protected val dispatcherProvider: DispatcherProvider,
+    private val pluginDependencies: MviPluginDependencies,
+) : ViewModel() {
 
-    init {
-        // The one wire in the whole base class: drain the intent stream into handleIntent.
-        // Collection is sequential, so intents are processed strictly in order and a
-        // reducer never races another reducer. Anything slow must therefore *start* work
-        // and return (delegate.load(), viewModelScope.launch { ... }) rather than await it
-        // inside handleIntent, or it would stall the queue.
-        viewModelScope.launch {
-            intents.collect { intent ->
-                onIntentReceived(intent)
-                try {
-                    handleIntent(intent)
-                } catch (cancellation: CancellationException) {
-                    throw cancellation
-                } catch (error: Throwable) {
-                    onIntentError(intent, error)
+    internal val _loadingPlugin: LoadingPluginImpl? =
+        if (this is HasLoadingPlugin) LoadingPluginImpl() else null
+
+    internal val _errorPlugin: ErrorPluginImpl? =
+        if (this is HasErrorPlugin) ErrorPluginImpl() else null
+
+    internal val _navigationPlugin: NavigationPluginImpl? =
+        if (this is HasNavigationPlugin) NavigationPluginImpl() else null
+
+    internal val _loggingPlugin: LoggingPluginImpl? =
+        if (this is HasLoggingPlugin) LoggingPluginImpl() else null
+
+    private val plugins: List<MVIPlugin> = listOfNotNull(
+        _loadingPlugin,
+        _errorPlugin,
+        _navigationPlugin,
+        _loggingPlugin,
+    )
+
+    private val intentChannel = Channel<I>(Channel.UNLIMITED)
+
+    /**
+     * Lazy on purpose: nothing spins up until something actually observes the screen.
+     * Plugin `onCreate` and the intent collector both start on first access to
+     * [viewState]. Until then intents are safely parked in the UNLIMITED channel.
+     */
+    private val _viewState: MutableStateFlow<T> by lazy {
+        MutableStateFlow(initialState()).also {
+            plugins.forEach { plugin -> plugin.onCreate(this, viewModelScope, pluginDependencies) }
+            viewModelScope.launch {
+                intentChannel.receiveAsFlow().collect { intent ->
+                    // Plugins get first look. Any plugin returning true consumes the
+                    // intent, and the feature's handleIntent never sees it.
+                    val handled = plugins.any { plugin -> plugin.onIntent(intent) }
+                    if (!handled) {
+                        handleIntent(intent)
+                    }
                 }
             }
         }
     }
 
-    /**
-     * Reduce one intent: update state, send effects, start work.
-     *
-     * Implement it as an exhaustive `when` over the sealed intent type and let the
-     * compiler tell you when a new intent has no handler.
-     */
-    protected abstract suspend fun handleIntent(intent: I)
+    val viewState: StateFlow<T> by lazy { _viewState.asStateFlow() }
+
+    private val _effect = MutableSharedFlow<E>()
+    val effect = _effect.asSharedFlow()
+
+    protected val currentState: T
+        get() = _viewState.value
+
+    abstract fun initialState(): T
+
+    abstract suspend fun handleIntent(intent: I)
+
+    /** The single entry point from the UI. Never suspends, never drops an intent. */
+    fun processIntent(intent: I) {
+        intentChannel.trySend(intent)
+    }
 
     /**
-     * Called for every intent before it is handled. The blueprint's logging /
-     * analytics / time-travel-debugging seam — override it to `Log.d(...)` every intent
-     * in debug builds and get a free audit trail of the whole screen.
-     */
-    protected open fun onIntentReceived(intent: I) = Unit
-
-    /**
-     * Last-resort handler for an exception thrown out of [handleIntent].
+     * Reduce state, then notify plugins.
      *
-     * Without this, one unhandled throw would cancel `viewModelScope` and the screen
-     * would silently stop responding to *all* further intents. The default rethrows so
-     * bugs stay loud; override to map the error into state instead.
+     * The `onStateChanged(old, new)` broadcast is what lets a plugin react to state
+     * without the feature knowing it exists — analytics on a step change, for instance.
      */
-    protected open fun onIntentError(intent: I, error: Throwable): Unit = throw error
+    protected fun updateState(reducer: T.() -> T) {
+        val oldState = currentState
+        _viewState.value = currentState.reducer()
+        val newState = currentState
+        plugins.forEach { it.onStateChanged(oldState, newState) }
+    }
+
+    protected fun emitEffect(effect: E) {
+        viewModelScope.launch(dispatcherProvider.main) {
+            _effect.emit(effect)
+            plugins.forEach { it.onEffectEmitted(effect) }
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        intentChannel.close()
+        plugins.forEach { it.onCleared() }
+    }
 }

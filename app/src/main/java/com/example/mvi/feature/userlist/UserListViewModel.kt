@@ -1,102 +1,104 @@
 package com.example.mvi.feature.userlist
 
 import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.example.mvi.core.MviViewModel
-import com.example.mvi.core.delegate.PaginationDelegate
-import com.example.mvi.core.delegate.SearchQueryDelegate
+import com.example.mvi.core.helpers.DispatcherProvider
+import com.example.mvi.core.plugins.HasErrorPlugin
+import com.example.mvi.core.plugins.HasLoadingPlugin
+import com.example.mvi.core.plugins.HasLoggingPlugin
+import com.example.mvi.core.plugins.HasNavigationPlugin
+import com.example.mvi.core.plugins.MviPluginDependencies
+import com.example.mvi.core.plugins.configureLogging
+import com.example.mvi.core.plugins.errors
+import com.example.mvi.core.plugins.loading
+import com.example.mvi.core.plugins.logging
+import com.example.mvi.core.plugins.navigation
+import com.example.mvi.data.FakeUserRepository
 import com.example.mvi.data.UserRepository
 import com.example.mvi.di.ServiceLocator
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
+import com.example.mvi.navigation.AppDestination
 
 /**
- * A paged, searchable list — in about 60 lines, none of which are a state machine.
+ * A screen that opts into all four plugins.
  *
- * The shape to copy for any list screen in the app:
+ * The four marker interfaces on the class declaration *are* the wiring — nothing is
+ * constructed, passed in, or registered. In exchange, `loading`, `errors`, `navigation`
+ * and `logging` are all in scope below.
  *
- * 1. **Compose** the delegates you need as private fields.
- * 2. **Project** each delegate's state into this screen's [UserListState] in `init`.
- * 3. **Route** intents to delegates in [handleIntent]. Every branch is one line.
- *
- * Everything hard — cancelling in-flight pages, not double-fetching, keeping the list on
- * screen when an append fails, debouncing the search — lives in `:mvi-core` and is
- * already unit-tested there. What is left here is only what makes *this* screen itself.
+ * `handleIntent` is `suspend` and intents are serialized, so the repository is awaited
+ * directly. No `viewModelScope.launch` anywhere in this file.
  */
 class UserListViewModel(
-    repository: UserRepository,
-) : MviViewModel<UserListIntent, UserListState, UserListEffect>(UserListState()) {
-
-    // 1. Compose.
-    private val search = SearchQueryDelegate(debounceMillis = 300)
-
-    private val paging = PaginationDelegate(
-        scope = viewModelScope,
-        pageSize = PAGE_SIZE,
-        // Reads the *live* query, so the delegate never needs to know a search box exists.
-        loader = { page, pageSize -> repository.users(search.query.value, page, pageSize) },
-    )
+    private val repository: UserRepository,
+    dispatcherProvider: DispatcherProvider,
+    pluginDependencies: MviPluginDependencies,
+) : MviViewModel<UserListViewState, UserListIntent, UserListEffect>(
+    dispatcherProvider,
+    pluginDependencies,
+),
+    HasLoadingPlugin,
+    HasErrorPlugin,
+    HasNavigationPlugin,
+    HasLoggingPlugin {
 
     init {
-        // 2. Project delegate state into screen state. This is the seam that keeps
-        //    UserListState flat: the UI sees fields, not delegates.
-        paging.state
-            .onEach { paging ->
-                val hadItems = currentState.users.isNotEmpty()
-                updateState {
-                    copy(
-                        users = paging.items,
-                        isRefreshing = paging.isRefreshing,
-                        isAppending = paging.isAppending,
-                        endReached = paging.endReached,
-                        errorMessage = paging.error?.userMessage(),
-                    )
-                }
-                // A failure with a list already on screen is a snackbar, not an error page.
-                val error = paging.error
-                if (error != null && hadItems) {
-                    sendEffect(UserListEffect.ShowMessage(error.userMessage()))
-                }
-            }
-            .launchIn(viewModelScope)
-
-        search.query
-            .onEach { query -> updateState { copy(query = query) } }
-            .launchIn(viewModelScope)
-
-        // A settled query restarts pagination from page 0.
-        search.debouncedQuery
-            .onEach {
-                paging.reset()
-                paging.refresh()
-            }
-            .launchIn(viewModelScope)
-
-        paging.refresh()
+        configureLogging(SCREEN_ID)
     }
 
-    // 3. Route. Note how little happens here - and that nothing suspends, so the intent
-    //    queue is never blocked by a slow network call.
+    override fun initialState() = UserListViewState()
+
     override suspend fun handleIntent(intent: UserListIntent) {
         when (intent) {
-            UserListIntent.Refresh -> paging.refresh()
-            UserListIntent.LoadNextPage -> paging.loadNextPage()
-            UserListIntent.RetryClicked -> paging.retry()
-            is UserListIntent.QueryChanged -> search.onQueryChanged(intent.query)
-            is UserListIntent.UserClicked -> sendEffect(UserListEffect.OpenUser(intent.userId))
+            UserListIntent.Load -> loadUsers()
+
+            UserListIntent.Retry -> {
+                logging.logButtonEvent("retry")
+                loadUsers()
+            }
+
+            is UserListIntent.UserClicked -> {
+                logging.logButtonEvent("user_row")
+                // Navigation is a plugin call, not an effect the UI has to interpret.
+                navigation.navigateTo(AppDestination.UserDetail(intent.userId))
+            }
+
+            is UserListIntent.SimulateFailureToggled -> {
+                (repository as? FakeUserRepository)?.simulateFailure = intent.enabled
+                updateState { copy(simulateFailure = intent.enabled) }
+                emitEffect(
+                    UserListEffect.ShowMessage(
+                        if (intent.enabled) "Next load will fail." else "Failures disabled."
+                    )
+                )
+            }
+        }
+    }
+
+    /**
+     * The shape worth copying: `withLoading` guarantees the spinner clears even on
+     * failure, and `runCatchingError` routes the throwable into the error plugin so this
+     * screen never declares an error field of its own.
+     */
+    private suspend fun loadUsers() {
+        loading.withLoading {
+            val users = errors.runCatchingError { repository.users() } ?: return@withLoading
+            updateState { copy(users = users) }
         }
     }
 
     companion object {
-        const val PAGE_SIZE = 20
+        private const val SCREEN_ID = "user_list"
 
         val Factory: ViewModelProvider.Factory = viewModelFactory {
-            initializer { UserListViewModel(ServiceLocator.userRepository) }
+            initializer {
+                UserListViewModel(
+                    repository = ServiceLocator.userRepository,
+                    dispatcherProvider = ServiceLocator.dispatcherProvider,
+                    pluginDependencies = ServiceLocator.pluginDependencies,
+                )
+            }
         }
     }
 }
-
-/** Maps a throwable to something worth showing a human. In a real app this is its own mapper. */
-private fun Throwable.userMessage(): String = message ?: "Something went wrong."

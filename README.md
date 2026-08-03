@@ -1,243 +1,276 @@
-# MVI Blueprint — base + delegation
+# MVI Blueprint — base ViewModel + plugin delegation
 
 A small, complete, runnable reference for building Android screens with MVI, organised
 around one idea:
 
-> **The base class gives you the MVI loop and nothing else. Everything else is composed
-> from delegates.**
+> **The parent class owns the MVI loop. Cross-cutting concerns are delegated to plugins
+> that install themselves based on the interfaces a screen implements.**
 
-Most MVI "base ViewModel" articles end with a base class that has grown a loading flag, a
-paging cursor, a debounce helper and an error mapper — and every screen in the app
-inherits all of it whether it needs it or not. This project shows the alternative:
-capabilities are small, independently testable objects that a screen *acquires*, either
-with Kotlin's `by` delegation or as a plain private field.
+Most "base ViewModel" designs end up with a class that has grown a loading flag, an error
+holder, a navigation helper and an analytics hook — and every screen inherits all of it
+whether it needs it or not. This project shows the alternative: the base keeps the loop it
+genuinely owns, and every other capability is an `MVIPlugin` that a screen opts into by
+implementing a marker interface.
 
-Nothing here is magic and nothing here is a framework you have to buy into. The whole core
-is ~400 lines of ordinary Kotlin you are meant to read, disagree with, and adapt.
+Nothing here is magic and nothing is a framework you have to buy into. The core is ~450
+lines of ordinary Kotlin you are meant to read, disagree with, and adapt.
 
 ---
 
-## The two kinds of delegation
+## The base owns the loop
 
-This is the distinction the whole blueprint rests on. They are not the same thing and they
-solve different problems.
-
-### 1. Primitive capabilities — mixed into the base with `by`
-
-An MVI ViewModel needs exactly three things: somewhere to keep state, somewhere to send
-one-shot effects, and somewhere to receive intents. Each is an interface with one
-implementation, and `MviViewModel` acquires all three by delegation instead of
-implementing them:
+`MviViewModel<T : ViewState, I : Intent, E : Effect>` holds the intent channel, the state
+flow, the effect flow, and the reducer — directly, with no indirection to chase:
 
 ```kotlin
-abstract class MviViewModel<I : MviIntent, S : MviState, E : MviEffect>(
-    initialState: S,
-) : ViewModel(),
-    StateStore<S>     by StateStoreDelegate(initialState),
-    EffectEmitter<E>  by EffectEmitterDelegate(),
-    IntentReceiver<I> by IntentReceiverDelegate() {
+abstract class MviViewModel<T : ViewState, I : Intent, E : Effect>(
+    protected val dispatcherProvider: DispatcherProvider,
+    private val pluginDependencies: MviPluginDependencies,
+) : ViewModel() {
 
-    init {
-        viewModelScope.launch { intents.collect { handleIntent(it) } }
+    private val intentChannel = Channel<I>(Channel.UNLIMITED)
+    val viewState: StateFlow<T>
+    val effect: SharedFlow<E>
+
+    abstract fun initialState(): T
+    abstract suspend fun handleIntent(intent: I)
+
+    fun processIntent(intent: I)
+    protected fun updateState(reducer: T.() -> T)
+    protected fun emitEffect(effect: E)
+}
+```
+
+Intents are serialized through the channel, one at a time, in order. **`handleIntent` is
+`suspend`**, so async work is awaited directly — no `viewModelScope.launch` in any feature.
+
+## Plugins are the delegation
+
+A plugin is a self-contained capability that observes the loop through five hooks:
+
+```kotlin
+interface MVIPlugin {
+    fun onCreate(viewModel: ViewModel, viewModelScope: CoroutineScope, dependencies: MviPluginDependencies) {}
+    fun onIntent(intent: Intent): Boolean = false      // return true to consume the intent
+    fun onStateChanged(oldState: ViewState, newState: ViewState) {}
+    fun onEffectEmitted(effect: Effect) {}
+    fun onCleared() {}
+}
+```
+
+Installation is by **marker interface**, checked in the base class:
+
+```kotlin
+internal val _loadingPlugin = if (this is HasLoadingPlugin) LoadingPluginImpl() else null
+```
+
+and reached through an **extension property on that same marker**:
+
+```kotlin
+val HasLoadingPlugin.loading: LoadingPluginImpl
+    get() = (this as MviViewModel<*, *, *>)._loadingPlugin ?: error("...")
+```
+
+That pairing is the part worth copying. A screen writes one word on its class declaration:
+
+```kotlin
+class CheckoutViewModel(...) : MviViewModel<...>(...),
+    HasLoadingPlugin,
+    HasErrorPlugin {
+
+    override suspend fun handleIntent(intent: CheckoutIntent) {
+        loading.withLoading {                                   // in scope, because of the marker
+            val cart = errors.runCatchingError { repo.cart() } ?: return@withLoading
+            updateState { copy(items = cart.items) }
+        }
     }
-
-    protected abstract suspend fun handleIntent(intent: I)
 }
 ```
 
-That `init` block is the only logic in the base class. Every screen inherits the loop and
-nothing more.
+Nothing is constructed, registered, or passed in. And a screen that *didn't* declare
+`HasLoadingPlugin` cannot write `loading` at all — it's a compile error, not a null. You
+get the ergonomics of a method on the base class with none of the cost.
 
-**Why not just put three `MutableStateFlow`s in the base class?** Because then they are
-welded in. As delegates: each one is unit-testable without constructing a ViewModel, each
-one is swappable (a `SavedStateStoreDelegate` that survives process death drops in with no
-change to the base), and the base class has no room to grow.
-
-### 2. Feature capabilities — composed as private fields
-
-Pagination, debounced search, one-shot loading: real behaviour that *some* screens need.
-These are **not** in the base class. A screen that needs pagination declares it:
-
-```kotlin
-private val paging = PaginationDelegate(viewModelScope, pageSize = 20) { page, size ->
-    repository.users(search.query.value, page, size)
-}
-```
-
-The delegate owns its own little state machine and knows nothing about the screen. The
-ViewModel *projects* that state into its own flat `MviState`, which is why the UI never
-learns that a delegate exists.
+**The consequence worth internalising:** `isLoading` and `error` are not fields on any
+screen's `ViewState`. They live on the plugins. No feature declares them again, and no
+feature can forget to clear them.
 
 ---
 
 ## The loop
 
 ```mermaid
-flowchart LR
-    UI["Composable<br/><i>pure function of state</i>"]
-    IR["IntentReceiverDelegate<br/><i>Channel, ordered</i>"]
-    H["handleIntent()<br/><i>route, don't implement</i>"]
-    D["Feature delegates<br/><i>Pagination · Search · Async</i>"]
-    SS["StateStoreDelegate<br/><i>StateFlow&lt;S&gt;</i>"]
-    EE["EffectEmitterDelegate<br/><i>Channel, once-only</i>"]
-    R["Repository"]
+flowchart TB
+    UI["Composable"]
+    PI["processIntent(intent)"]
+    CH["intentChannel<br/><i>UNLIMITED, serialized</i>"]
+    HOOK["plugins.any { onIntent(it) }"]
+    HI["handleIntent(intent)<br/><i>suspend</i>"]
+    US["updateState { }"]
+    EE["emitEffect()"]
+    VS["viewState: StateFlow"]
+    EF["effect: SharedFlow"]
+    PL["Installed plugins<br/>loading · errors · navigation · logging"]
 
-    UI -- "onIntent(Intent)" --> IR
-    IR --> H
-    H -- "route" --> D
-    H -- "updateState { }" --> SS
-    H -- "sendEffect()" --> EE
-    D <--> R
-    D -- "project into state" --> SS
-    SS -- "collectAsStateWithLifecycle()" --> UI
-    EE -- "CollectEffects { }" --> UI
+    UI --> PI --> CH --> HOOK
+    HOOK -- "not consumed" --> HI
+    HI --> US --> VS --> UI
+    HI --> EE --> EF --> UI
+    HI --> PL
+    US -. "onStateChanged" .-> PL
+    EE -. "onEffectEmitted" .-> PL
+    PL -- "navigate / log" --> UI
 ```
 
-One direction, no cycles you can't see. The UI reports *facts* (`LoadNextPage` — "the user
-scrolled near the bottom"), never decisions ("fetch page 3").
+Plugins get **first look** at every intent. Any plugin returning `true` from `onIntent`
+consumes it, and the feature's `handleIntent` never sees it.
 
 ---
 
 ## Modules
 
 ```
-:mvi-core          The blueprint. No DI, no networking, no app code. Depend on this.
-  core/            MviIntent · MviState · MviEffect · MviViewModel · Async
-  core/state/      StateStore + StateStoreDelegate
-  core/effect/     EffectEmitter + EffectEmitterDelegate
-  core/intent/     IntentReceiver + IntentReceiverDelegate
-  core/delegate/   PaginationDelegate · SearchQueryDelegate · AsyncDelegate
+:mvi-core          The blueprint. No DI framework, no networking, no app code.
+  core/            ViewState · Intent · Effect · NoEffect · MviViewModel
+  core/plugins/    MVIPlugin · markers · accessors · MviPluginDependencies
+                   LoadingPluginImpl · ErrorPluginImpl · NavigationPluginImpl · LoggingPluginImpl
+  core/navigation/ Navigator, Destination, NavCommand + CollectNavigation
+  core/analytics/  AnalyticsLogger, AnalyticsEvent
+  core/error/      OperationError
+  core/helpers/    DispatcherProvider
   core/compose/    CollectEffects
 
 :app               A sample that consumes it.
   data/            UserRepository interface + an in-memory fake
-  di/              A 3-line ServiceLocator (swap for Hilt/Koin without touching :mvi-core)
-  feature/userlist/    Paged + searchable list — PaginationDelegate + SearchQueryDelegate
-  feature/userdetail/  Single load — AsyncDelegate
-  navigation/      NavHost; features emit effects, they never hold a NavController
+  di/              A small ServiceLocator (swap for Hilt without touching :mvi-core)
+  feature/userlist/    Opts into all four plugins
+  feature/userdetail/  Opts into three — no logging, and `logging` won't compile there
+  navigation/      The only file that imports androidx.navigation
 ```
 
 ---
 
 ## Adding a screen — the four steps
 
-Every screen in this project is the same four steps. Copy `feature/userdetail` and edit.
-
-**1. Write the contract.** One file, three declarations, and now the whole screen is
-knowable by reading it.
+**1. Write the contract.** Three declarations in one file. Leave loading and errors out —
+the plugins own those.
 
 ```kotlin
-sealed interface CartIntent : MviIntent {
-    data object CheckoutClicked : CartIntent
+sealed interface CartIntent : Intent {
+    data object Load : CartIntent
     data class QuantityChanged(val itemId: String, val quantity: Int) : CartIntent
 }
 
-data class CartState(
-    val items: List<CartRow> = emptyList(),
-    val isLoading: Boolean = false,
-) : MviState
+data class CartViewState(val items: List<CartRow> = emptyList()) : ViewState
 
-sealed interface CartEffect : MviEffect {
-    data object OpenCheckout : CartEffect
+sealed interface CartEffect : Effect {
+    data class ShowMessage(val text: String) : CartEffect
 }
+// No one-shot events at all? Use the shared `NoEffect` as your Effect type.
 ```
 
-**2. Compose, project, route.** The ViewModel body is always these three parts in this
-order.
+**2. Declare the ViewModel and the plugins it wants.**
 
 ```kotlin
-class CartViewModel(repository: CartRepository)
-    : MviViewModel<CartIntent, CartState, CartEffect>(CartState()) {
+class CartViewModel(
+    private val repository: CartRepository,
+    dispatcherProvider: DispatcherProvider,
+    pluginDependencies: MviPluginDependencies,
+) : MviViewModel<CartViewState, CartIntent, CartEffect>(dispatcherProvider, pluginDependencies),
+    HasLoadingPlugin,
+    HasErrorPlugin,
+    HasNavigationPlugin {
 
-    // Compose
-    private val cart = AsyncDelegate(viewModelScope) { repository.cart() }
+    override fun initialState() = CartViewState()
 
-    // Project
-    init {
-        cart.state
-            .onEach { async -> updateState { copy(items = async.valueOrNull.orEmpty(), isLoading = async.isLoading) } }
-            .launchIn(viewModelScope)
-        cart.load()
-    }
-
-    // Route
     override suspend fun handleIntent(intent: CartIntent) = when (intent) {
-        CartIntent.CheckoutClicked -> sendEffect(CartEffect.OpenCheckout)
+        CartIntent.Load -> loading.withLoading {
+            val cart = errors.runCatchingError { repository.cart() } ?: return@withLoading
+            updateState { copy(items = cart.rows) }
+        }
         is CartIntent.QuantityChanged -> updateState { /* ... */ }
     }
 }
 ```
 
-**3. Split the UI in two.** A stateful `Route` that owns the ViewModel and handles
-effects, and a stateless `Screen` that is a pure function of state. The second half is
-what you can `@Preview` and screenshot-test.
+**3. Split the UI in two.** A stateful `Route` that owns the ViewModel and collects the
+three streams, and a stateless `Screen` that is a pure function of them.
 
 ```kotlin
 @Composable
-fun CartRoute(onCheckout: () -> Unit, viewModel: CartViewModel = viewModel(factory = ...)) {
-    val state by viewModel.state.collectAsStateWithLifecycle()
-    CollectEffects(viewModel.effect) { effect ->
-        when (effect) { CartEffect.OpenCheckout -> onCheckout() }
-    }
-    CartScreen(state = state, onIntent = viewModel::onIntent)
+fun CartRoute(viewModel: CartViewModel = viewModel(factory = ...)) {
+    val state by viewModel.viewState.collectAsStateWithLifecycle()
+    val isLoading by viewModel.loading.isLoading.collectAsStateWithLifecycle()
+    val error by viewModel.errors.error.collectAsStateWithLifecycle()
+
+    CollectEffects(viewModel.effect) { effect -> /* snackbars, not navigation */ }
+
+    CartScreen(state, isLoading, error, viewModel::processIntent)
 }
 ```
 
-**4. Test through the contract.** No Robolectric, no mocking framework, no `Thread.sleep`.
+**4. Test through the contract.** Assert screen data on `viewState`, and loading/errors on
+the plugins.
 
 ```kotlin
 @Test
-fun `checkout opens the checkout screen`() = runTest {
-    val viewModel = CartViewModel(FakeCartRepository())
-    viewModel.effect.test {
-        viewModel.onIntent(CartIntent.CheckoutClicked)
-        advanceUntilIdle()
-        assertEquals(CartEffect.OpenCheckout, awaitItem())
-    }
+fun `a failure lands in the error plugin`() = runTest {
+    val viewModel = CartViewModel(FailingRepository(), dispatchers, dependencies)
+    viewModel.viewState.value                       // lazy init: start the collector
+    viewModel.processIntent(CartIntent.Load)
+    advanceUntilIdle()
+
+    assertEquals("offline", viewModel.errors.error.value?.message)
+    assertFalse(viewModel.loading.isLoading.value)
 }
 ```
 
 ---
 
-## Adding a delegate
+## Adding a plugin
 
-When two screens need the same non-trivial behaviour, that is the signal — **not** a
-reason to add a method to `MviViewModel`. A delegate is any class that:
+When two screens need the same cross-cutting behaviour, that is the signal.
 
-1. takes a `CoroutineScope` as a constructor parameter (never creates its own);
-2. exposes a `StateFlow` of its own small state;
-3. exposes plain functions to drive it;
-4. knows nothing about any screen.
+1. Implement `MVIPlugin`, overriding only the hooks you need.
+2. Add a `HasXxxPlugin` marker in `PluginMarkers.kt`.
+3. Add the accessor in `PluginAccessors.kt`.
+4. Add the install line and the `plugins` list entry in `MviViewModel`.
 
-Rule 1 is what makes it testable with `runTest`'s scope and no `Dispatchers.setMain`.
-Rule 4 is what makes it reusable — the moment a delegate imports a feature's `State`, it
-has become that feature's code.
+**Step 4 is the one closed part of the design, and it's worth knowing about**: the plugin
+set is hardcoded in the base class, so a new plugin means editing `MviViewModel` — and a
+feature module can't define its own. That is the deliberate trade for auto-installation
+with zero per-screen wiring and compile-time safety. If you later want open registration,
+the change is to build `plugins` from a list supplied through `MviPluginDependencies`,
+at the cost of the `this is HasXxxPlugin` check and the non-null accessors.
 
 ---
 
 ## The rules worth arguing about
 
-**State or effect?** *If the screen rotated right now, should this happen again?* Yes →
-state. No → effect. A snackbar is an effect. An error banner is state.
+**State, effect, or plugin?** Does it belong to *this screen only*? → `ViewState`. Is it a
+one-shot UI event, like a snackbar? → `Effect`. Does every screen need it — loading,
+errors, navigation, analytics? → a plugin. Navigation in particular is a plugin here, not
+an effect.
 
-**Intents are named after what happened, not what to do.** `RetryClicked`, not
-`ReloadUsers`. The UI reports; the ViewModel decides. This is what stops business logic
-leaking into Composables.
+**Intents are named after what happened, not what to do.** `UserClicked`, not `OpenUser`.
+The UI reports; the ViewModel decides.
 
-**`handleIntent` must not block.** Intents are processed sequentially, in order, so a
-branch that awaits the network stalls every later intent. Branches *start* work
-(`paging.refresh()`) and return.
+**`handleIntent` may suspend, and should.** Intents are serialized through an UNLIMITED
+channel, so awaiting the network is correct and the next intent simply queues. This is the
+opposite of the usual "fire and forget" advice, and it's what removes `launch` from every
+feature.
 
-**`updateState { }` must be pure.** It can run more than once under concurrent updates.
-Never send an effect or start work inside it.
+**Prefer `withLoading` and `runCatchingError` over manual flags.** The `finally` in
+`withLoading` is why a spinner never sticks after a thrown exception.
 
-**State is flat and render-ready.** `UserListState` exposes `isAppending: Boolean`, not
-the `PagingState` it came from. The projection step in `init` is what buys you the freedom
-to change delegates later without touching a Composable.
+**Nothing spins up until the screen is observed.** `viewState` is `by lazy`, and plugin
+`onCreate` plus the intent collector both start on first access. Intents sent before then
+are parked safely in the channel — but calling `navigation.navigateTo(...)` from `init`
+throws, because the plugin has no `Navigator` yet. Navigate from an intent, not from `init`.
 
-**Effects go through a `Channel`, never a `SharedFlow(replay = 1)`.** A replayed effect is
-how "the app navigates twice after rotation" happens. `PrimitiveDelegatesTest` has the
-test that pins this down.
+**Effects have no replay and no buffer.** `emitEffect` suspends until a collector is
+active, so an effect emitted while the screen is stopped is delivered when it returns —
+but ordering across several such effects isn't guaranteed. Keep effects few.
 
 ---
 
@@ -247,33 +280,29 @@ test that pins this down.
 ./gradlew :app:installDebug
 ```
 
-The sample loads 137 fake users, 20 at a time, with a debounced search box. To see the
-error and retry paths, **type `fail` into the search box** — failure is deterministic, not
-random, so you can demo it on purpose.
-
-Run the tests:
+The sample lists 24 fake users. Flip **Simulate failure** and reload to exercise
+`ErrorPlugin` and the retry path — the failure is deterministic, so you can demo it on
+purpose. Tap a row to see `NavigationPlugin` drive the NavHost, and watch Logcat's
+`Analytics` tag for `LoggingPlugin` output.
 
 ```bash
 ./gradlew test
 ```
 
-39 unit tests, all JVM, no emulator: 26 for the core primitives and delegates, 8 for a
-full screen, 5 for search debouncing.
+24 unit tests, all JVM, no emulator: 11 for the base class, 7 for the plugins standalone,
+6 for a full screen.
 
 ---
 
 ## What is deliberately not here
 
-- **A DI framework.** `ServiceLocator` is three lines. Swapping in Hilt or Koin changes
-  the `Factory` in each ViewModel's companion object and nothing else.
-- **Networking.** `FakeUserRepository` is in memory, so the project runs with no keys and
-  no connection.
-- **`SavedStateHandle` state restoration.** Left out to keep `StateStoreDelegate` at ten
-  lines — and adding it is a new delegate, not a change to the base class, which is the
-  point.
-- **A `Reducer` abstraction.** A `when` in `handleIntent` is already exhaustive, already
-  compiler-checked, and already readable. A pluggable reducer interface would add a layer
-  and buy nothing here.
+- **A DI framework.** In production `MviPluginDependencies` is `@Inject`-constructed and
+  field-injected into the base. The blueprint passes it as a constructor parameter — the
+  only intentional difference from the production shape.
+- **Networking.** `FakeUserRepository` is in memory, so the project runs with no keys.
+- **Pagination, search, and other per-screen behaviours.** They aren't cross-cutting, so
+  they don't belong in a plugin; they belong in a feature's own ViewModel or its data layer.
+- **`SavedStateHandle` restoration.** Would be a good fifth plugin.
 
-Each of those is a reasonable thing to add. If adding one requires editing `MviViewModel`,
-the design has gone wrong.
+If adding a capability requires changing `handleIntent` in a dozen features, it should
+have been a plugin.

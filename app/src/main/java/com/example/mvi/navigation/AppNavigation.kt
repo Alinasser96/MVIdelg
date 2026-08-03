@@ -8,49 +8,51 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.example.mvi.core.navigation.CollectNavigation
+import com.example.mvi.core.navigation.NavCommand
+import com.example.mvi.di.ServiceLocator
 import com.example.mvi.feature.userdetail.UserDetailRoute
 import com.example.mvi.feature.userlist.UserListRoute
 
 /**
- * Navigation lives outside the features.
+ * The single place that knows about `androidx.navigation`.
  *
- * A screen never holds a `NavController`; it emits an effect (`OpenUser`, `NavigateBack`)
- * and its Route translates that into a call here. That is why every ViewModel in this
- * project is testable without Android: navigation is a value they emit, not an API they call.
+ * ViewModels call `navigation.navigateTo(...)`, the `NavigationPlugin` turns that into a
+ * [NavCommand] on the app-wide `Navigator`, and this collector applies it. No feature
+ * holds a `NavHostController`, which is why every ViewModel in the sample is a plain JVM
+ * object under test.
  */
-object Destinations {
-    const val USER_LIST = "users"
-    const val USER_DETAIL = "users/{userId}"
-    const val USER_ID_ARG = "userId"
-
-    fun userDetail(userId: Int) = "users/$userId"
-}
-
 @Composable
 fun AppNavigation(
     modifier: Modifier = Modifier,
     navController: NavHostController = rememberNavController(),
 ) {
+    CollectNavigation(ServiceLocator.navigator) { command ->
+        when (command) {
+            is NavCommand.To -> navController.navigate(command.destination.route)
+            is NavCommand.Back -> navController.popBackStack()
+            is NavCommand.PopUpTo -> navController.popBackStack(
+                route = command.route,
+                inclusive = command.inclusive,
+            )
+        }
+    }
+
     NavHost(
         navController = navController,
-        startDestination = Destinations.USER_LIST,
+        startDestination = AppDestination.ROUTE_USER_LIST,
         modifier = modifier,
     ) {
-        composable(Destinations.USER_LIST) {
-            UserListRoute(
-                onOpenUser = { userId ->
-                    navController.navigate(Destinations.userDetail(userId))
-                },
-            )
+        composable(AppDestination.ROUTE_USER_LIST) {
+            UserListRoute()
         }
 
         composable(
-            route = Destinations.USER_DETAIL,
-            arguments = listOf(navArgument(Destinations.USER_ID_ARG) { type = NavType.IntType }),
+            route = AppDestination.ROUTE_USER_DETAIL,
+            arguments = listOf(navArgument(AppDestination.ARG_USER_ID) { type = NavType.IntType }),
         ) { entry ->
             UserDetailRoute(
-                userId = entry.arguments?.getInt(Destinations.USER_ID_ARG) ?: 0,
-                onBack = { navController.popBackStack() },
+                userId = entry.arguments?.getInt(AppDestination.ARG_USER_ID) ?: 0,
             )
         }
     }
