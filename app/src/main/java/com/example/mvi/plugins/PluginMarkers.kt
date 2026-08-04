@@ -1,6 +1,6 @@
 package com.example.mvi.plugins
 
-import com.example.mvi.core.plugins.PluggableMviViewModel
+import com.example.mvi.core.MviViewModel
 import com.example.mvi.core.plugins.MVIPlugin
 import com.example.mvi.core.plugins.requirePlugin
 import com.example.mvi.di.ServiceLocator
@@ -25,16 +25,16 @@ interface HasNavigationPlugin
 interface HasLoggingPlugin
 
 val HasLoadingPlugin.loading: LoadingPlugin
-    get() = (this as PluggableMviViewModel<*, *, *>).requirePlugin()
+    get() = (this as MviViewModel<*, *, *>).requirePlugin()
 
 val HasErrorPlugin.errors: ErrorPlugin
-    get() = (this as PluggableMviViewModel<*, *, *>).requirePlugin()
+    get() = (this as MviViewModel<*, *, *>).requirePlugin()
 
 val HasNavigationPlugin.navigation: NavigationPlugin
-    get() = (this as PluggableMviViewModel<*, *, *>).requirePlugin()
+    get() = (this as MviViewModel<*, *, *>).requirePlugin()
 
 val HasLoggingPlugin.logging: LoggingPlugin
-    get() = (this as PluggableMviViewModel<*, *, *>).requirePlugin()
+    get() = (this as MviViewModel<*, *, *>).requirePlugin()
 
 /**
  * The set most screens in this app install.

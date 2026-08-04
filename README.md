@@ -1,46 +1,47 @@
 # MVI Blueprint
 
-A small MVI base for Android Compose. One parent class owns the MVI loop, and everything
-else is a **plugin** you write.
+A small MVI base for Android Compose. **One ViewModel class**, `MviViewModel`, owning the
+MVI loop — an intent channel, a state flow, an effect channel, a reducer.
 
-**Plugins are opt-in, at the class level.** There are two base classes:
+**Plugins are optional.** Pass none and you have plain MVI:
 
-| Extend | When | Sees plugins? |
-| --- | --- | --- |
-| `MviViewModel` | Plain MVI — a channel, a state flow, a reducer | **No.** The word `plugin` appears nowhere in it |
-| `PluggableMviViewModel` | You want installable capabilities | Yes — it's `MviViewModel` plus four overrides |
+```kotlin
+class ProfileViewModel(
+    private val repository: UserRepository,
+) : MviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>()
+```
+
+Pass some when a concern turns out to be shared:
+
+```kotlin
+class ProfileViewModel(
+    private val repository: UserRepository,
+) : MviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>(
+    listOf(LoadingPlugin(), ErrorPlugin()),
+)
+```
+
+Same class, same loop. The only difference is the argument.
 
 **And the library ships zero plugins.** Loading, errors, navigation and analytics aren't
-privileged concepts baked into a base class — they're four ordinary plugins the demo app
+privileged concepts baked into the base — they're four ordinary plugins the demo app
 writes, in [app/…/plugins/](app/src/main/java/com/example/mvi/plugins). Yours sit
 alongside them as equals, written exactly the same way.
 
-Plain MVI, no plugin machinery anywhere:
+`:mvi-core` is five files: the three marker types, the ViewModel, the plugin interface,
+the plugin lookup, and a Compose helper.
+
+Here is the second version in full — a complete screen with loading state, error handling,
+retry, and no `viewModelScope.launch` anywhere:
 
 ```kotlin
 class ProfileViewModel(
     private val repository: UserRepository,
-) : MviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>() {
-
-    override fun initialState() = ProfileViewState()
-
-    override suspend fun handleIntent(intent: ProfileIntent) {
-        val user = repository.user(id)   // suspend call, no launch needed
-        updateState { copy(user = user) }
-    }
-}
-```
-
-The same screen once loading and errors are worth sharing:
-
-```kotlin
-class ProfileViewModel(
-    private val repository: UserRepository,
-) : PluggableMviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>(
+) : MviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>(
     listOf(LoadingPlugin(), ErrorPlugin()),
 ),
-    HasLoadingPlugin,      // <- your marker, gives you `loading`
-    HasErrorPlugin {       // <- your marker, gives you `errors`
+    HasLoadingPlugin,      // <- your marker, puts `loading` in scope
+    HasErrorPlugin {       // <- your marker, puts `errors` in scope
 
     override fun initialState() = ProfileViewState()
 
@@ -96,8 +97,8 @@ third declaration.
 
 ## Step 3. Write the ViewModel — version 1, no plugins
 
-Extend `MviViewModel` and implement two functions. It takes **no constructor arguments**
-and has no notion of a plugin — nothing to install, nothing to configure.
+Extend `MviViewModel`, implement two functions. **Pass no plugins at all**; the argument
+defaults to empty.
 
 ```kotlin
 class ProfileViewModel(
@@ -143,9 +144,8 @@ ignore them.
 | [`NavigationPlugin`](app/src/main/java/com/example/mvi/plugins/NavigationPlugin.kt) | `HasNavigationPlugin` | `navigation` | `navigateTo(dest)`, `navigateBack()` |
 | [`LoggingPlugin`](app/src/main/java/com/example/mvi/plugins/LoggingPlugin.kt) | `HasLoggingPlugin` | `logging` | `logButtonEvent("id")` |
 
-Switch the base class to `PluggableMviViewModel`, pass the instances, and declare the
-matching markers. Here is Step 3's screen again, unchanged except where the plugins take
-over:
+Install by passing instances, and declare the matching markers. Here is Step 3's screen
+again, unchanged except where the plugins take over:
 
 ```kotlin
 // Two fields leave the state — the plugins hold them now.
@@ -153,8 +153,8 @@ data class ProfileViewState(val user: User? = null) : ViewState
 
 class ProfileViewModel(
     private val repository: UserRepository,
-) : PluggableMviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>(
-    listOf(LoadingPlugin(), ErrorPlugin()),
+) : MviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>(
+    listOf(LoadingPlugin(), ErrorPlugin()),   // <- the only new argument
 ),
     HasLoadingPlugin,      // <- puts `loading` in scope
     HasErrorPlugin {       // <- puts `errors` in scope
@@ -173,16 +173,16 @@ class ProfileViewModel(
 }
 ```
 
-What changed, and nothing else did:
+What changed, and nothing else did — **same class, same generics, same two overrides**:
 
-- the base class went from `MviViewModel` to `PluggableMviViewModel`
+- a plugin list is passed where Step 3 passed nothing
 - `isLoading` and `errorMessage` left `ProfileViewState` — no screen declares them again
 - the try/catch/finally became `withLoading` + `runCatchingError`
 - two markers appeared, which is what puts `loading` and `errors` in scope
 
-A plugin needing a collaborator (`NavigationPlugin` wants a `Navigator`) takes it in its
-own constructor, so pass it down or take `plugins: List<MVIPlugin>` as a parameter — that
-is what the sample's factories do.
+A plugin needing a collaborator — `NavigationPlugin(navigator)` — takes it in its own
+constructor, so accept it as a ViewModel parameter and pass it down. That is the only
+reason the sample's ViewModels take a `plugins: List<MVIPlugin>` argument.
 
 `navigation` is **not** in scope here — no `HasNavigationPlugin`. Leave a marker off and
 that accessor doesn't exist for your class: a compile error, not a null.
@@ -274,28 +274,11 @@ A single collector, started in the base class's `init`, drains the channel **one
 a time, in order**. This is why `handleIntent` can be `suspend`: while it awaits the
 network, the next intent just waits its turn. No races, no `launch` in features.
 
-## Step 3. The intercept seam gets first look
+## Step 3. Plugins get first look
 
 ```kotlin
-if (!interceptIntent(intent)) handleIntent(intent)
-```
-
-`interceptIntent` is one of four `protected open` **seams** on `MviViewModel` — typed in
-your own `T`/`I`/`E`, no-ops by default, and knowing nothing about plugins:
-
-| Seam | Runs |
-| --- | --- |
-| `interceptIntent(intent: I): Boolean` | Before `handleIntent`. Return true to swallow |
-| `afterStateUpdate(old: T, new: T)` | After every `updateState` |
-| `afterEffect(effect: E)` | After every `emitEffect` |
-| `onDispose()` | With `onCleared`, after the channels close |
-
-Override them directly for one-off behaviour. `PluggableMviViewModel` is nothing more than
-a subclass that overrides all four and forwards each to a list of plugins:
-
-```kotlin
-final override fun interceptIntent(intent: I): Boolean =
-    plugins.map { it.onIntent(intent) }.any { it }
+val handled = plugins.map { it.onIntent(intent) }.any { it }
+if (!handled) handleIntent(intent)
 ```
 
 Every plugin sees every intent. Any plugin returning `true` **consumes** it, and your
@@ -397,8 +380,7 @@ flowchart TB
     end
 
     subgraph L4["Library · :mvi-core"]
-        BASE["MviViewModel<br/><i>2 channels · 1 StateFlow · 4 seams</i>"]
-        PLG["PluggableMviViewModel<br/><i>seams -> plugin list</i>"]
+        BASE["MviViewModel<br/><i>2 channels · 1 StateFlow</i>"]
         IFACE["MVIPlugin + requirePlugin()<br/><i>no implementations</i>"]
     end
 
@@ -411,16 +393,15 @@ flowchart TB
     PLUG -->|"plugin state"| RTE
     PLUG -->|"NavCommand"| NAVR
     NAVR -->|"collected once"| HOST
-    FVM -.->|"extends"| PLG
-    PLG -.->|"extends"| BASE
+    FVM -.->|"extends"| BASE
     PLUG -.->|"implements"| IFACE
 ```
 
 ```
-:mvi-core          six files, no plugins
+:mvi-core          five files, no plugins
   MviMarkers.kt      ViewState · Intent · Effect · NoEffect
-  MviViewModel.kt    the loop + four seams — knows nothing about plugins
-  plugins/           MVIPlugin · PluggableMviViewModel · requirePlugin / pluginOrNull
+  MviViewModel.kt    the loop
+  plugins/           MVIPlugin · requirePlugin / pluginOrNull
   compose/           CollectEffects
 
 :app
@@ -497,7 +478,7 @@ interface HasUndoPlugin
 
 ```kotlin
 val HasUndoPlugin.undo: UndoPlugin
-    get() = (this as PluggableMviViewModel<*, *, *>).requirePlugin()
+    get() = (this as MviViewModel<*, *, *>).requirePlugin()
 ```
 
 Use `pluginOrNull<UndoPlugin>()` instead if the plugin is genuinely optional.
@@ -509,7 +490,7 @@ Pass the instance and implement the marker.
 ```kotlin
 class EditorViewModel(
     undoPlugin: UndoPlugin = UndoPlugin(),   // a constructor param, so it can be passed below
-) : PluggableMviViewModel<EditViewState, EditIntent, NoEffect>(listOf(undoPlugin)),
+) : MviViewModel<EditViewState, EditIntent, NoEffect>(listOf(undoPlugin)),
     HasUndoPlugin {
 
     override suspend fun handleIntent(intent: EditIntent) = when (intent) {
@@ -536,8 +517,8 @@ and retry. Tap a row for `NavigationPlugin`. Watch Logcat's `Analytics` tag for
 ./gradlew test
 ```
 
-35 JVM unit tests, no emulator: 10 for the plain MVI loop, 9 for the plugin layer, 6 for
-the example plugins, 6 for a full screen, 4 for writing a plugin from scratch.
+33 JVM unit tests, no emulator: 17 for the base and the plugin mechanism, 6 for the
+example plugins, 6 for a full screen, 4 for writing a plugin from scratch.
 
 ## Not included
 

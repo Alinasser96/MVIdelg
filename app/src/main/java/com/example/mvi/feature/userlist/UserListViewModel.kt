@@ -3,7 +3,7 @@ package com.example.mvi.feature.userlist
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
-import com.example.mvi.core.plugins.PluggableMviViewModel
+import com.example.mvi.core.MviViewModel
 import com.example.mvi.core.plugins.MVIPlugin
 import com.example.mvi.data.FakeUserRepository
 import com.example.mvi.data.UserRepository
@@ -32,7 +32,7 @@ import com.example.mvi.plugins.standardPlugins
 class UserListViewModel(
     private val repository: UserRepository,
     plugins: List<MVIPlugin>,
-) : PluggableMviViewModel<UserListViewState, UserListIntent, UserListEffect>(plugins),
+) : MviViewModel<UserListViewState, UserListIntent, UserListEffect>(plugins),
     HasLoadingPlugin,
     HasErrorPlugin,
     HasNavigationPlugin,

@@ -1,7 +1,7 @@
 package com.example.mvi
 
 import com.example.mvi.core.Intent
-import com.example.mvi.core.plugins.PluggableMviViewModel
+import com.example.mvi.core.MviViewModel
 import com.example.mvi.core.NoEffect
 import com.example.mvi.core.ViewState
 import com.example.mvi.core.plugins.MVIPlugin
@@ -116,7 +116,7 @@ interface HasUndoPlugin
 // ---- Step 3: the accessor ----
 
 val HasUndoPlugin.undo: UndoPlugin
-    get() = (this as PluggableMviViewModel<*, *, *>).requirePlugin()
+    get() = (this as MviViewModel<*, *, *>).requirePlugin()
 
 // ---- Step 4: install it ----
 
@@ -131,7 +131,7 @@ private class EditorViewModel(
     // Constructor params, so they can be passed to the superclass call below.
     undoPlugin: UndoPlugin = UndoPlugin(),
     guard: GuardPlugin? = null,
-) : PluggableMviViewModel<EditViewState, EditIntent, NoEffect>(listOfNotNull(undoPlugin, guard)),
+) : MviViewModel<EditViewState, EditIntent, NoEffect>(listOfNotNull(undoPlugin, guard)),
     HasUndoPlugin {
 
     val handledIntents = mutableListOf<EditIntent>()
@@ -149,7 +149,7 @@ private class EditorViewModel(
 
 /** Declares the marker but never installs the plugin. */
 private class ForgotToInstallViewModel :
-    PluggableMviViewModel<EditViewState, EditIntent, NoEffect>(emptyList()),
+    MviViewModel<EditViewState, EditIntent, NoEffect>(),
     HasUndoPlugin {
 
     override fun initialState() = EditViewState()
