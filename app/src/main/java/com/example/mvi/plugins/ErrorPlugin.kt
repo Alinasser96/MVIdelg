@@ -1,14 +1,29 @@
-package com.example.mvi.core.plugins
+package com.example.mvi.plugins
 
-import com.example.mvi.core.error.OperationError
+import com.example.mvi.core.plugins.MVIPlugin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.coroutines.cancellation.CancellationException
+
+/** A failure worth showing a human, as opposed to a raw [Throwable]. */
+data class OperationError(
+    val message: String,
+    val cause: Throwable? = null,
+) {
+    companion object {
+        fun from(throwable: Throwable): OperationError =
+            OperationError(throwable.message ?: "Something went wrong.", throwable)
+    }
+}
 
 /**
- * Plugin for managing error states.
+ * Example plugin: error state.
+ *
+ * Like [LoadingPlugin], it holds state the whole app shares rather than something any one
+ * screen owns — which is why no `ViewState` in the sample declares an `errorMessage`.
  */
-class ErrorPluginImpl : MVIPlugin {
+class ErrorPlugin : MVIPlugin {
 
     private val _error = MutableStateFlow<OperationError?>(null)
     val error: StateFlow<OperationError?> = _error.asStateFlow()
@@ -29,7 +44,7 @@ class ErrorPluginImpl : MVIPlugin {
     suspend fun <R> runCatchingError(block: suspend () -> R): R? = try {
         clearError()
         block()
-    } catch (cancellation: kotlin.coroutines.cancellation.CancellationException) {
+    } catch (cancellation: CancellationException) {
         throw cancellation
     } catch (throwable: Throwable) {
         setError(OperationError.from(throwable))

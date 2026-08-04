@@ -1,6 +1,6 @@
 package com.example.mvi.navigation
 
-import com.example.mvi.core.navigation.Destination
+import com.example.mvi.plugins.Destination
 
 /**
  * Where the app can go. Features name a destination; only the NavHost knows how to get

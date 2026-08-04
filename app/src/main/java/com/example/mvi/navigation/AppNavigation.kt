@@ -8,8 +8,8 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
-import com.example.mvi.core.navigation.CollectNavigation
-import com.example.mvi.core.navigation.NavCommand
+import com.example.mvi.plugins.CollectNavigation
+import com.example.mvi.plugins.NavCommand
 import com.example.mvi.di.ServiceLocator
 import com.example.mvi.feature.userdetail.UserDetailRoute
 import com.example.mvi.feature.userlist.UserListRoute

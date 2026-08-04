@@ -4,48 +4,39 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.example.mvi.core.MviViewModel
-import com.example.mvi.core.helpers.DispatcherProvider
-import com.example.mvi.core.plugins.HasErrorPlugin
-import com.example.mvi.core.plugins.HasLoadingPlugin
-import com.example.mvi.core.plugins.HasLoggingPlugin
-import com.example.mvi.core.plugins.HasNavigationPlugin
-import com.example.mvi.core.plugins.MviPluginDependencies
-import com.example.mvi.core.plugins.configureLogging
-import com.example.mvi.core.plugins.errors
-import com.example.mvi.core.plugins.loading
-import com.example.mvi.core.plugins.logging
-import com.example.mvi.core.plugins.navigation
+import com.example.mvi.core.plugins.MVIPlugin
 import com.example.mvi.data.FakeUserRepository
 import com.example.mvi.data.UserRepository
 import com.example.mvi.di.ServiceLocator
 import com.example.mvi.navigation.AppDestination
+import com.example.mvi.plugins.HasErrorPlugin
+import com.example.mvi.plugins.HasLoadingPlugin
+import com.example.mvi.plugins.HasLoggingPlugin
+import com.example.mvi.plugins.HasNavigationPlugin
+import com.example.mvi.plugins.errors
+import com.example.mvi.plugins.loading
+import com.example.mvi.plugins.logging
+import com.example.mvi.plugins.navigation
+import com.example.mvi.plugins.standardPlugins
 
 /**
- * A screen that opts into all four plugins.
+ * A screen that installs all four of this app's plugins.
  *
- * The four marker interfaces on the class declaration *are* the wiring — nothing is
- * constructed, passed in, or registered. In exchange, `loading`, `errors`, `navigation`
- * and `logging` are all in scope below.
+ * The `plugins` argument and the four markers are the whole wiring. Nothing is registered
+ * anywhere, and `:mvi-core` knows about none of these capabilities — they are this app's
+ * code, sitting in `com.example.mvi.plugins`.
  *
  * `handleIntent` is `suspend` and intents are serialized, so the repository is awaited
  * directly. No `viewModelScope.launch` anywhere in this file.
  */
 class UserListViewModel(
     private val repository: UserRepository,
-    dispatcherProvider: DispatcherProvider,
-    pluginDependencies: MviPluginDependencies,
-) : MviViewModel<UserListViewState, UserListIntent, UserListEffect>(
-    dispatcherProvider,
-    pluginDependencies,
-),
+    plugins: List<MVIPlugin>,
+) : MviViewModel<UserListViewState, UserListIntent, UserListEffect>(plugins),
     HasLoadingPlugin,
     HasErrorPlugin,
     HasNavigationPlugin,
     HasLoggingPlugin {
-
-    init {
-        configureLogging(SCREEN_ID)
-    }
 
     override fun initialState() = UserListViewState()
 
@@ -95,8 +86,7 @@ class UserListViewModel(
             initializer {
                 UserListViewModel(
                     repository = ServiceLocator.userRepository,
-                    dispatcherProvider = ServiceLocator.dispatcherProvider,
-                    pluginDependencies = ServiceLocator.pluginDependencies,
+                    plugins = standardPlugins(SCREEN_ID),
                 )
             }
         }

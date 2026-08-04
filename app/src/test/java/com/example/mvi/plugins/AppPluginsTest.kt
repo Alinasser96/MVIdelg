@@ -1,37 +1,32 @@
-package com.example.mvi.core
+package com.example.mvi.plugins
 
 import androidx.lifecycle.ViewModel
 import app.cash.turbine.test
-import com.example.mvi.core.analytics.AnalyticsEvent
-import com.example.mvi.core.error.OperationError
-import com.example.mvi.core.navigation.ChannelNavigator
-import com.example.mvi.core.navigation.NavCommand
-import com.example.mvi.core.plugins.ErrorPluginImpl
-import com.example.mvi.core.plugins.LoadingPluginImpl
-import com.example.mvi.core.plugins.LoggingPluginImpl
-import com.example.mvi.core.plugins.NavigationPluginImpl
+import com.example.mvi.platform.DispatcherProvider
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Every plugin is a plain class with no ViewModel and no Android in sight, so each one
- * tests on its own. That is the practical payoff of installing capabilities rather than
- * inheriting them.
+ * The four example plugins, each tested on its own.
+ *
+ * None of them needs a ViewModel, a scope, or Android — they are plain classes that
+ * happen to implement `MVIPlugin`. That is the practical payoff of a plugin owning its
+ * own state and taking its own dependencies.
  */
-class PluginsTest {
+class AppPluginsTest {
 
     // ---- LoadingPlugin ----
 
     @Test
     fun `withLoading toggles around the block`() = runTest {
-        val plugin = LoadingPluginImpl()
+        val plugin = LoadingPlugin()
         assertFalse(plugin.isLoading.value)
 
         plugin.withLoading {
@@ -43,7 +38,7 @@ class PluginsTest {
 
     @Test
     fun `withLoading clears the spinner even when the block throws`() = runTest {
-        val plugin = LoadingPluginImpl()
+        val plugin = LoadingPlugin()
 
         runCatching { plugin.withLoading { error("boom") } }
 
@@ -56,7 +51,7 @@ class PluginsTest {
 
     @Test
     fun `runCatchingError captures the failure instead of throwing`() = runTest {
-        val plugin = ErrorPluginImpl()
+        val plugin = ErrorPlugin()
 
         val result = plugin.runCatchingError { error("offline") }
 
@@ -66,7 +61,7 @@ class PluginsTest {
 
     @Test
     fun `a successful run clears any previous error`() = runTest {
-        val plugin = ErrorPluginImpl()
+        val plugin = ErrorPlugin()
         plugin.setError(OperationError("stale"))
 
         val result = plugin.runCatchingError { "ok" }
@@ -80,12 +75,7 @@ class PluginsTest {
     @Test
     fun `navigation commands reach the navigator`() = runTest {
         val navigator = ChannelNavigator()
-        val plugin = NavigationPluginImpl()
-        plugin.onCreate(
-            FakeViewModel(),
-            this,
-            testPluginDependencies(StandardTestDispatcher(testScheduler), navigator),
-        )
+        val plugin = NavigationPlugin(navigator)
 
         navigator.commands.test {
             plugin.navigateTo(TestDestination("profile"))
@@ -99,20 +89,21 @@ class PluginsTest {
     // ---- LoggingPlugin ----
 
     @Test
-    fun `logging attributes every event to the configured screen`() = runTest {
+    fun `logging attributes every event to the screen given at construction`() = runTest {
         val logger = RecordingAnalyticsLogger()
-        val plugin = LoggingPluginImpl()
-        plugin.onCreate(
-            FakeViewModel(),
-            this,
-            testPluginDependencies(StandardTestDispatcher(testScheduler), analyticsLogger = logger),
+        val plugin = LoggingPlugin(
+            analyticsLogger = logger,
+            dispatchers = TestDispatchers(StandardTestDispatcher(testScheduler)),
+            screenId = "checkout",
         )
+        plugin.onCreate(FakeViewModel(), this)
 
-        plugin.configure("checkout")
         plugin.logButtonEvent("pay_clicked")
         plugin.logFieldEvent("card_number")
         advanceUntilIdle()
 
+        // Taking screenId in the constructor is what removed the old configure-me-first
+        // step, and with it the chance of shipping events with a blank screen id.
         assertEquals(
             listOf(
                 AnalyticsEvent.Button("pay_clicked", "checkout"),
@@ -121,20 +112,23 @@ class PluginsTest {
             logger.events,
         )
     }
+}
 
-    @Test
-    fun `logging before configure fails loudly rather than sending a blank screen id`() = runTest {
-        val plugin = LoggingPluginImpl()
-        plugin.onCreate(
-            FakeViewModel(),
-            this,
-            testPluginDependencies(StandardTestDispatcher(testScheduler)),
-        )
+// ---- Test doubles ----
 
-        assertThrows(IllegalStateException::class.java) {
-            plugin.logButtonEvent("pay_clicked")
-        }
+private data class TestDestination(override val route: String) : Destination
+
+private class FakeViewModel : ViewModel()
+
+private class RecordingAnalyticsLogger : AnalyticsLogger {
+    val events = mutableListOf<AnalyticsEvent>()
+    override suspend fun log(event: AnalyticsEvent) {
+        events += event
     }
 }
 
-private class FakeViewModel : ViewModel()
+private class TestDispatchers(private val dispatcher: CoroutineDispatcher) : DispatcherProvider {
+    override val main: CoroutineDispatcher get() = dispatcher
+    override val io: CoroutineDispatcher get() = dispatcher
+    override val default: CoroutineDispatcher get() = dispatcher
+}

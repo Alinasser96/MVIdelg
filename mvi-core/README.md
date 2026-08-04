@@ -1,6 +1,6 @@
 # `:mvi-core`
 
-The reusable half of the blueprint. No DI framework, no networking, no app code.
+The library. Five files, no plugins, no DI framework, no networking, no app code.
 
 ```kotlin
 dependencies {
@@ -8,8 +8,19 @@ dependencies {
 }
 ```
 
-Only the `compose` package and `CollectNavigation` touch Compose; everything else is plain
-Kotlin + Coroutines and works from a JVM module with no UI toolkit.
+Only `compose/` touches Compose; the rest is plain Kotlin + Coroutines and works from a
+JVM module with no UI toolkit.
+
+```
+MviMarkers.kt          ViewState · Intent · Effect · NoEffect
+MviViewModel.kt        the loop
+plugins/MVIPlugin.kt   the extension interface — no implementations
+plugins/PluginLookup.kt requirePlugin() · pluginOrNull()
+compose/MviCompose.kt  CollectEffects
+```
+
+**There are deliberately no built-in plugins.** Loading, errors, navigation and analytics
+are app concerns; `:app/plugins` shows one way to write them.
 
 ---
 
@@ -24,13 +35,9 @@ Kotlin + Coroutines and works from a JVM module with no UI toolkit.
 
 ## `MviViewModel<T : ViewState, I : Intent, E : Effect>`
 
-The parent class. Owns the loop; installs plugins by marker.
-
 ```kotlin
 abstract class MviViewModel<T : ViewState, I : Intent, E : Effect>(
-    dispatcherProvider: DispatcherProvider,
-    pluginDependencies: MviPluginDependencies,
-    additionalPlugins: List<MVIPlugin> = emptyList(),
+    private val plugins: List<MVIPlugin> = emptyList(),
 ) : ViewModel()
 ```
 
@@ -44,121 +51,81 @@ abstract class MviViewModel<T : ViewState, I : Intent, E : Effect>(
 | `handleIntent(i)` *abstract, suspend* | Route one intent. **May suspend** — intents are serialized, so awaiting is correct. |
 | `updateState { }` *protected* | Atomic reduce via `getAndUpdate`, then broadcast `onStateChanged`. The reducer must be **pure** — it may run twice. |
 | `emitEffect(e)` *protected* | Queue an effect, then broadcast `onEffectEmitted`. Non-suspending. |
+| `pluginOrNull(KClass)` | Find an installed plugin. Backs the reified helpers below. |
 
 Intents arrive on a `Channel(UNLIMITED)`. Every plugin sees every intent via
 `plugins.map { it.onIntent(intent) }.any { it }` — mapped before reduced, so a plugin's
 visibility never depends on its position in the list — and any plugin returning `true`
 consumes the intent so `handleIntent` never sees it.
 
-Plugins are created in `init`, before any subclass `init` runs, so they are usable from a
+Plugins are set up in `init`, before any subclass `init` runs, so they are usable from a
 subclass constructor. Only `initialState()` is deferred, because calling an abstract member
 from the base constructor would run before the subclass finished initializing.
 
-## Plugins
+## `MVIPlugin`
 
 ```kotlin
 interface MVIPlugin {
-    fun onCreate(viewModel: ViewModel, viewModelScope: CoroutineScope, dependencies: MviPluginDependencies) {}
-    fun onIntent(intent: Intent): Boolean = false
+    fun onCreate(viewModel: ViewModel, viewModelScope: CoroutineScope) {}
+    fun onIntent(intent: Intent): Boolean = false   // true consumes the intent
     fun onStateChanged(oldState: ViewState, newState: ViewState) {}
     fun onEffectEmitted(effect: Effect) {}
     fun onCleared() {}
 }
 ```
 
-Install by implementing the marker; reach it through the accessor.
+Every hook has a default. A plugin takes what it needs in its own constructor — there is
+no dependency container here, and the ViewModel that installs a plugin supplies it.
 
-| Marker | Accessor | Plugin |
-| --- | --- | --- |
-| `HasLoadingPlugin` | `loading` | `LoadingPluginImpl` |
-| `HasErrorPlugin` | `errors` | `ErrorPluginImpl` |
-| `HasNavigationPlugin` | `navigation` | `NavigationPluginImpl` |
-| `HasLoggingPlugin` | `logging` + `configureLogging(screenId)` | `LoggingPluginImpl` |
+Note a consuming plugin **cannot change screen state**: `updateState` belongs to the
+ViewModel. Consumption suits guards, gating and interception.
 
-The accessors are extension properties **on the markers**, so an accessor only resolves
-inside a class that declared the marker. Forgetting it is a compile error, not a runtime null.
+## Lookup
 
-**`LoadingPluginImpl`** — `isLoading: StateFlow<Boolean>`, `show()`, `hide()`,
-`withLoading { }`. Prefer `withLoading`: its `finally` clears the spinner even when the
-block throws or is cancelled.
-
-**`ErrorPluginImpl`** — `error: StateFlow<OperationError?>`, `setError`, `clearError`,
-`runCatchingError { }` (returns null on failure, rethrows `CancellationException`).
-
-**`NavigationPluginImpl`** — `navigateTo(destination)`, `navigateBack(results)`,
-`navigateBackWithResults(results)`, `popUpTo(routeClass, results, inclusive)`. Sends
-`NavCommand`s to the app-wide `Navigator`; ViewModels never touch a `NavController`.
-
-**`LoggingPluginImpl`** — `configure(screenId)` once, then `logButtonEvent(id)` /
-`logFieldEvent(id)`. Logging before configuring throws, so events can't ship with a blank
-screen id.
-
-**`MviPluginDependencies`** — the one bag handed to every plugin's `onCreate`, carrying
-`navigator`, `analyticsLogger` and `dispatcherProvider`. One bag rather than per-plugin
-constructor args is what keeps installation automatic.
-
-## Compose
-
-```kotlin
-CollectEffects(viewModel.effect) { effect -> /* suspend body */ }   // lifecycle-aware
-CollectNavigation(navigator) { command -> /* apply to the NavHost */ }  // once, at the host
-```
-
----
-
-## Adding a plugin from outside this module
-
-No changes to `:mvi-core` required.
-
-```kotlin
-class UndoPlugin : MVIPlugin { /* override the hooks you need */ }
-
-interface HasUndoPlugin
-
-val HasUndoPlugin.undo: UndoPlugin
-    get() = (this as MviViewModel<*, *, *>).requirePlugin()
-
-class EditorViewModel(
-    dispatcherProvider: DispatcherProvider,
-    pluginDependencies: MviPluginDependencies,
-    undoPlugin: UndoPlugin = UndoPlugin(),
-) : MviViewModel<S, I, E>(dispatcherProvider, pluginDependencies, listOf(undoPlugin)),
-    HasUndoPlugin
-```
-
-| Lookup | |
+| | |
 | --- | --- |
 | `requirePlugin<P>()` | The installed plugin, or throws naming the missing type. |
 | `pluginOrNull<P>()` | Null when not installed, for genuinely optional plugins. |
 | `pluginOrNull(KClass<P>)` | Non-reified member the two above delegate to. |
 
-Worked example, written from a consumer module:
-[CustomPluginTest.kt](../app/src/test/java/com/example/mvi/CustomPluginTest.kt).
-
-**Only edit `:mvi-core`** to get marker-alone auto-installation like the built-in four —
-add the marker to `PluginMarkers.kt`, the accessor to `PluginAccessors.kt`, and the install
-line plus `plugins` entry in `MviViewModel`. That saves the explicit `additionalPlugins`
-argument, at the cost of a base-class change and a new `:mvi-core` dependency.
-
----
-
-## Testing
-
-Every plugin is a plain class, so each tests on its own with no ViewModel and no Android:
+The pattern these exist for — three pieces, all in your module:
 
 ```kotlin
-@Test
-fun `withLoading clears the spinner even when the block throws`() = runTest {
-    val plugin = LoadingPluginImpl()
-    runCatching { plugin.withLoading { error("boom") } }
-    assertFalse(plugin.isLoading.value)
-}
+class LoadingPlugin : MVIPlugin { ... }                 // 1. the capability
+
+interface HasLoadingPlugin                              // 2. the marker
+
+val HasLoadingPlugin.loading: LoadingPlugin             // 3. the accessor
+    get() = (this as MviViewModel<*, *, *>).requirePlugin()
 ```
 
-Tests that construct a real `MviViewModel` need `MainDispatcherRule` (`viewModelScope` runs
-on `Dispatchers.Main`) and must touch `viewState` once to trigger the lazy init before
-sending intents.
+Because the accessor extends the marker, `loading` only resolves inside a class that
+declared it — a compile error rather than a null. Install by passing an instance:
+
+```kotlin
+class ProfileViewModel(plugins: List<MVIPlugin>) :
+    MviViewModel<S, I, E>(plugins), HasLoadingPlugin
+```
+
+Worked example: [CustomPluginTest.kt](../app/src/test/java/com/example/mvi/CustomPluginTest.kt).
+Four production-shaped ones: [app/…/plugins/](../app/src/main/java/com/example/mvi/plugins).
+
+## Compose
+
+```kotlin
+CollectEffects(viewModel.effect) { effect -> /* suspend body */ }
+```
+
+Lifecycle-aware effect collection. Stops below `STARTED`, uses `rememberUpdatedState` so a
+recreated callback isn't captured forever, and is keyed so a fresh lambda per recomposition
+doesn't restart collection.
+
+## Testing
 
 ```bash
 ./gradlew :mvi-core:test
 ```
+
+Plugins are plain classes, so each tests on its own with no ViewModel and no Android.
+Tests that construct a real `MviViewModel` need `MainDispatcherRule`, because
+`viewModelScope` runs on `Dispatchers.Main`.

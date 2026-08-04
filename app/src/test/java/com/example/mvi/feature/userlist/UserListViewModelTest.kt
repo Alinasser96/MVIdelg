@@ -2,14 +2,17 @@ package com.example.mvi.feature.userlist
 
 import app.cash.turbine.test
 import com.example.mvi.MainDispatcherRule
-import com.example.mvi.core.analytics.AnalyticsEvent
-import com.example.mvi.core.analytics.AnalyticsLogger
-import com.example.mvi.core.helpers.DispatcherProvider
-import com.example.mvi.core.navigation.ChannelNavigator
-import com.example.mvi.core.navigation.NavCommand
-import com.example.mvi.core.plugins.MviPluginDependencies
-import com.example.mvi.core.plugins.errors
-import com.example.mvi.core.plugins.loading
+import com.example.mvi.plugins.AnalyticsEvent
+import com.example.mvi.plugins.AnalyticsLogger
+import com.example.mvi.platform.DispatcherProvider
+import com.example.mvi.plugins.ChannelNavigator
+import com.example.mvi.plugins.ErrorPlugin
+import com.example.mvi.plugins.LoadingPlugin
+import com.example.mvi.plugins.LoggingPlugin
+import com.example.mvi.plugins.NavCommand
+import com.example.mvi.plugins.NavigationPlugin
+import com.example.mvi.plugins.errors
+import com.example.mvi.plugins.loading
 import com.example.mvi.data.User
 import com.example.mvi.data.UserRepository
 import com.example.mvi.navigation.AppDestination
@@ -37,13 +40,19 @@ class UserListViewModelTest {
     private val navigator = ChannelNavigator()
     private val analytics = RecordingAnalyticsLogger()
 
+    // The production factory calls standardPlugins(); a test builds the same four with
+    // test doubles. Nothing is registered anywhere, so there is nothing to override.
     private fun viewModel(repository: UserRepository) = UserListViewModel(
         repository = repository,
-        dispatcherProvider = TestDispatchers(mainDispatcherRule.testDispatcher),
-        pluginDependencies = MviPluginDependencies(
-            navigator = navigator,
-            analyticsLogger = analytics,
-            dispatcherProvider = TestDispatchers(mainDispatcherRule.testDispatcher),
+        plugins = listOf(
+            LoadingPlugin(),
+            ErrorPlugin(),
+            NavigationPlugin(navigator),
+            LoggingPlugin(
+                analyticsLogger = analytics,
+                dispatchers = TestDispatchers(mainDispatcherRule.testDispatcher),
+                screenId = "user_list",
+            ),
         ),
     )
 

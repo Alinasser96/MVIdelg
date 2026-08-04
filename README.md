@@ -1,20 +1,23 @@
 # MVI Blueprint
 
-A small MVI base for Android Compose. One parent class owns the MVI loop; everything
-cross-cutting — loading, errors, navigation, analytics — is a **plugin** a screen opts into
-by implementing a marker interface.
+A small MVI base for Android Compose. One parent class owns the MVI loop, and everything
+else is a **plugin** you write.
 
-You never write `isLoading` again, and a screen that didn't ask for loading can't even
-name it.
+**The library ships zero plugins.** Loading, errors, navigation and analytics aren't
+privileged concepts baked into a base class — they're four ordinary plugins the demo app
+writes, in [app/…/plugins/](app/src/main/java/com/example/mvi/plugins). Yours sit
+alongside them as equals, written exactly the same way.
+
+`:mvi-core` is five files: the three marker types, the ViewModel, the plugin interface,
+the plugin lookup, and a Compose helper.
 
 ```kotlin
 class ProfileViewModel(
     private val repository: UserRepository,
-    dispatcherProvider: DispatcherProvider,
-    pluginDependencies: MviPluginDependencies,
-) : MviViewModel<ProfileViewState, ProfileIntent, NoEffect>(dispatcherProvider, pluginDependencies),
-    HasLoadingPlugin,      // <- gives you `loading`
-    HasErrorPlugin {       // <- gives you `errors`
+    plugins: List<MVIPlugin>,
+) : MviViewModel<ProfileViewState, ProfileIntent, NoEffect>(plugins),
+    HasLoadingPlugin,      // <- your marker, gives you `loading`
+    HasErrorPlugin {       // <- your marker, gives you `errors`
 
     override fun initialState() = ProfileViewState()
 
@@ -27,7 +30,7 @@ class ProfileViewModel(
 }
 ```
 
-That's a complete screen: loading state, error handling, retry-ready, and no
+A complete screen: loading state, error handling, retry-ready, and no
 `viewModelScope.launch` anywhere.
 
 ---
@@ -44,8 +47,8 @@ dependencies {
 
 ## Step 2. Write the contract
 
-One file per screen, three declarations. **Leave out `isLoading` and `errorMessage`** —
-plugins own those.
+One file per screen, three declarations. **Leave out `isLoading` and `errorMessage`** if
+you have plugins holding those — see Step 4.
 
 ```kotlin
 sealed interface ProfileIntent : Intent {
@@ -66,33 +69,24 @@ third declaration.
 
 ## Step 3. Write the ViewModel
 
-Extend `MviViewModel`, implement two functions, and list the plugins you want.
+Extend `MviViewModel`, implement two functions.
 
 ```kotlin
 class ProfileViewModel(
     private val repository: UserRepository,
-    dispatcherProvider: DispatcherProvider,
-    pluginDependencies: MviPluginDependencies,
-) : MviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>(
-    dispatcherProvider,
-    pluginDependencies,
-),
-    HasLoadingPlugin,
-    HasErrorPlugin,
-    HasNavigationPlugin {
+    plugins: List<MVIPlugin> = emptyList(),
+) : MviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>(plugins) {
 
     override fun initialState() = ProfileViewState()
 
     override suspend fun handleIntent(intent: ProfileIntent) {
         when (intent) {
-            ProfileIntent.Load, ProfileIntent.Retry -> load()
-            ProfileIntent.BackClicked -> navigation.navigateBack()
+            ProfileIntent.Load, ProfileIntent.Retry -> {
+                val user = repository.user(id)   // suspend call, no launch needed
+                updateState { copy(user = user) }
+            }
+            ProfileIntent.BackClicked -> emitEffect(ProfileEffect.GoBack)
         }
-    }
-
-    private suspend fun load() = loading.withLoading {
-        val user = errors.runCatchingError { repository.user(id) } ?: return@withLoading
-        updateState { copy(user = user) }
     }
 }
 ```
@@ -100,19 +94,43 @@ class ProfileViewModel(
 `handleIntent` is `suspend`, and intents are handled one at a time in order — so call
 suspending code directly. No `launch`.
 
-## Step 4. Pick your plugins
+That is a working screen with **no plugins at all**. Add them when a concern turns out to
+be shared.
 
-Add the marker, get the accessor. That's the whole API.
+## Step 4. Add plugins for the shared concerns
 
-| Add this marker | You get | Use it for |
-| --- | --- | --- |
-| `HasLoadingPlugin` | `loading` | `loading.withLoading { }`, `loading.isLoading` |
-| `HasErrorPlugin` | `errors` | `errors.runCatchingError { }`, `errors.error` |
-| `HasNavigationPlugin` | `navigation` | `navigation.navigateTo(dest)`, `navigateBack()` |
-| `HasLoggingPlugin` | `logging` | `logging.logButtonEvent("id")` — call `configureLogging("screen_id")` in `init` first |
+The demo app writes four. They aren't special — read them as examples and take, adapt or
+ignore them.
 
-Leave a marker off and that accessor doesn't exist for your class. It's a compile error,
-not a null.
+| Plugin (in `:app`) | Marker | Accessor | What it does |
+| --- | --- | --- | --- |
+| [`LoadingPlugin`](app/src/main/java/com/example/mvi/plugins/LoadingPlugin.kt) | `HasLoadingPlugin` | `loading` | `withLoading { }`, `isLoading` |
+| [`ErrorPlugin`](app/src/main/java/com/example/mvi/plugins/ErrorPlugin.kt) | `HasErrorPlugin` | `errors` | `runCatchingError { }`, `error` |
+| [`NavigationPlugin`](app/src/main/java/com/example/mvi/plugins/NavigationPlugin.kt) | `HasNavigationPlugin` | `navigation` | `navigateTo(dest)`, `navigateBack()` |
+| [`LoggingPlugin`](app/src/main/java/com/example/mvi/plugins/LoggingPlugin.kt) | `HasLoggingPlugin` | `logging` | `logButtonEvent("id")` |
+
+Install by passing instances, and declare the matching markers:
+
+```kotlin
+class ProfileViewModel(
+    private val repository: UserRepository,
+    plugins: List<MVIPlugin>,
+) : MviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>(plugins),
+    HasLoadingPlugin,
+    HasErrorPlugin {
+    // `loading` and `errors` are now in scope. `navigation` is not — no marker.
+}
+
+// at the factory
+ProfileViewModel(repository, plugins = listOf(LoadingPlugin(), ErrorPlugin()))
+```
+
+Leave a marker off and that accessor doesn't exist for your class — a compile error, not a
+null. `standardPlugins("screen_id")` in
+[PluginMarkers.kt](app/src/main/java/com/example/mvi/plugins/PluginMarkers.kt) bundles all
+four for screens that want the lot.
+
+**Writing your own plugin is Step 4 done from scratch — see [Adding a plugin](#adding-a-plugin).**
 
 ## Step 5. Write the screen
 
@@ -136,22 +154,15 @@ fun ProfileRoute(viewModel: ProfileViewModel = viewModel(factory = ...)) {
 
     ProfileScreen(state, isLoading, error, viewModel::processIntent)
 }
-
-@Composable
-fun ProfileScreen(
-    state: ProfileViewState,
-    isLoading: Boolean,
-    error: OperationError?,
-    onIntent: (ProfileIntent) -> Unit,
-) { /* ... onIntent(ProfileIntent.Retry) ... */ }
 ```
 
-You collect **three** streams: your own `viewState`, plus `isLoading` and `error` from the
-plugins. That's the visible cost of not putting them in `ViewState`.
+You collect **one stream per source of truth**: your own `viewState`, plus anything the
+plugins hold. That's the visible cost of not putting loading and errors in `ViewState`.
 
 ## Step 6. Wire navigation once, for the whole app
 
-Features never touch a `NavController`. One collector applies their commands:
+The demo's `NavigationPlugin` turns calls into `NavCommand`s on an app-wide `Navigator`.
+One collector applies them, so features never touch a `NavController`:
 
 ```kotlin
 CollectNavigation(ServiceLocator.navigator) { command ->
@@ -165,13 +176,13 @@ CollectNavigation(ServiceLocator.navigator) { command ->
 
 ## Step 7. Test it
 
-Send intents. Assert screen data on `viewState`, and loading/errors on the plugins. No
+Send intents. Assert screen data on `viewState`, and anything else on the plugins. No
 Robolectric, no mocking library.
 
 ```kotlin
 @Test
 fun `a failure lands in the error plugin`() = runTest {
-    val viewModel = ProfileViewModel(FailingRepository(), dispatchers, dependencies)
+    val viewModel = ProfileViewModel(FailingRepository(), listOf(LoadingPlugin(), ErrorPlugin()))
 
     viewModel.processIntent(ProfileIntent.Load)
     advanceUntilIdle()
@@ -257,52 +268,36 @@ sequenceDiagram
     LP-->>UI: isLoading = false
 ```
 
-## How a plugin gets installed
+## How a plugin becomes reachable
 
-This is the part that makes the whole thing work. Three pieces hang off one marker
-interface.
-
-**1. You implement the marker.**
-
-```kotlin
-class ProfileViewModel(...) : MviViewModel<...>(...), HasLoadingPlugin
-```
-
-**2. The base detects it and installs the plugin.**
-
-```kotlin
-internal val _loadingPlugin = if (this is HasLoadingPlugin) LoadingPluginImpl() else null
-```
-
-**3. An extension property on the same marker reaches it.**
-
-```kotlin
-val HasLoadingPlugin.loading: LoadingPluginImpl
-    get() = (this as MviViewModel<*, *, *>)._loadingPlugin ?: error("...")
-```
-
-Because the accessor extends `HasLoadingPlugin`, it only resolves inside a class that
-declared the marker. That's the compile-time scoping.
+The library gives you `requirePlugin()`. The marker and accessor are three lines you write
+once per plugin, and they're what turn a list entry into a typed, compile-time-scoped
+property.
 
 ```mermaid
-graph LR
-    VM["ProfileViewModel"]
-    MK["HasLoadingPlugin<br/><i>marker interface</i>"]
-    BS["MviViewModel base<br/><i>if this is HasLoadingPlugin</i>"]
-    IMPL["LoadingPluginImpl<br/><i>isLoading · withLoading</i>"]
-    ACC["val HasLoadingPlugin.loading<br/><i>extension property</i>"]
+graph TB
+    subgraph YOURS["You write these — in your app"]
+        P["LoadingPlugin : MVIPlugin<br/><i>holds isLoading, withLoading</i>"]
+        M["interface HasLoadingPlugin<br/><i>empty marker</i>"]
+        A["val HasLoadingPlugin.loading<br/><i>get() = requirePlugin()</i>"]
+    end
 
-    VM ==>|"1 · implements"| MK
-    MK -->|"2 · detected at construction"| BS
-    BS ==>|"3 · installs"| IMPL
-    MK -->|"4 · brings into scope"| ACC
-    ACC -->|"5 · resolves to"| IMPL
-    IMPL ==>|"6 · loading.withLoading"| VM
+    VM["ProfileViewModel<br/><i>MviViewModel(listOf(LoadingPlugin()))</i><br/><i>: HasLoadingPlugin</i>"]
+    USE["loading.withLoading { }<br/><i>resolves only inside the marker</i>"]
+
+    P -->|"passed to the constructor"| VM
+    M -->|"implemented by"| VM
+    A -->|"extends"| M
+    VM ==>|"in scope"| USE
+    A ==>|"looks it up"| USE
 ```
 
-Plugins are created in the base `init`, so they're usable from your own `init` too. Each
-one gets `onCreate(viewModel, scope, dependencies)`, which is how `NavigationPlugin`
-receives a `Navigator` without your ViewModel passing one.
+Because the accessor extends the marker, `loading` only resolves inside a class that
+declared `HasLoadingPlugin`. That's the compile-time scoping — a screen that never asked
+for loading cannot name it.
+
+Plugins are set up in the base `init`, so they're usable from your own `init` too. Each
+gets `onCreate(viewModel, scope)`; anything else it needs comes from its own constructor.
 
 ## Where everything lives
 
@@ -314,45 +309,45 @@ flowchart TB
     end
 
     subgraph L2["Feature · :app"]
-        FVM["Feature ViewModel<br/><i>MviViewModel + Has*Plugin markers</i>"]
+        FVM["Feature ViewModel<br/><i>MviViewModel + your markers</i>"]
         REPO["Repository<br/><i>interface + fake</i>"]
     end
 
-    subgraph L3["Blueprint · :mvi-core"]
-        BASE["MviViewModel base<br/><i>2 channels · 1 StateFlow</i>"]
-        PLUG["Installed plugins<br/><i>Loading · Error · Navigation · Logging</i>"]
-        DEPS["MviPluginDependencies<br/><i>navigator · analytics · dispatchers</i>"]
-    end
-
-    subgraph L4["Navigation"]
+    subgraph L3["Your plugins · :app"]
+        PLUG["LoadingPlugin · ErrorPlugin<br/>NavigationPlugin · LoggingPlugin"]
         NAVR["Navigator<br/><i>NavCommand stream</i>"]
         HOST["AppNavigation<br/><i>the only androidx.navigation import</i>"]
     end
 
+    subgraph L4["Library · :mvi-core"]
+        BASE["MviViewModel<br/><i>2 channels · 1 StateFlow</i>"]
+        IFACE["MVIPlugin + requirePlugin()<br/><i>no implementations</i>"]
+    end
+
     SCR -->|"intent"| RTE
-    RTE -->|"state · isLoading · error"| SCR
+    RTE -->|"state · plugin state"| SCR
     RTE -->|"processIntent"| FVM
     FVM -->|"viewState · effect"| RTE
     FVM -->|"suspend calls"| REPO
-    FVM -.->|"extends"| BASE
-    DEPS -->|"onCreate"| PLUG
-    BASE -->|"installs by marker"| PLUG
-    PLUG -->|"isLoading · error"| RTE
+    FVM -->|"installs"| PLUG
+    PLUG -->|"plugin state"| RTE
     PLUG -->|"NavCommand"| NAVR
     NAVR -->|"collected once"| HOST
+    FVM -.->|"extends"| BASE
+    PLUG -.->|"implements"| IFACE
 ```
 
 ```
-:mvi-core
-  core/            ViewState · Intent · Effect · NoEffect · MviViewModel
-  core/plugins/    MVIPlugin · markers · accessors · the four plugins
-  core/navigation/ Navigator · Destination · NavCommand · CollectNavigation
-  core/analytics/  AnalyticsLogger · AnalyticsEvent
-  core/error/      OperationError
-  core/helpers/    DispatcherProvider
-  core/compose/    CollectEffects
+:mvi-core          five files, no plugins
+  MviMarkers.kt      ViewState · Intent · Effect · NoEffect
+  MviViewModel.kt    the loop
+  plugins/           MVIPlugin · requirePlugin / pluginOrNull
+  compose/           CollectEffects
 
-:app               data/ · di/ · feature/userlist/ · feature/userdetail/ · navigation/
+:app
+  plugins/           the four example plugins, their markers and accessors
+  platform/          DispatcherProvider
+  data/ · di/ · feature/ · navigation/
 ```
 
 ---
@@ -363,8 +358,11 @@ flowchart TB
   contention — never send an effect or start work inside it.
 - **`handleIntent` blocks the queue while it suspends.** That's the design, but don't put
   a 30-second poll in it.
-- **`configureLogging(screenId)` before any `logging.` call**, or it throws.
-- **Navigation is a plugin, not an effect.** Effects are for snackbars and toasts.
+- **A consuming plugin can't change screen state.** `updateState` belongs to the
+  ViewModel, so `onIntent` returning `true` suits guards and interception, not reducers.
+- **A marker and its plugin can disagree.** The compiler stops you using an accessor
+  without its marker, but nothing checks the plugins list — that mismatch throws from
+  `requirePlugin()` naming the missing type.
 
 **State, effect, or plugin?**
 
@@ -378,19 +376,20 @@ graph TD
     Q2 -->|"no"| E["Effect"]
 ```
 
-## Adding your own plugin
+## Adding a plugin
 
-**You never have to fork or edit `:mvi-core`.** Four steps, all in your own module — the
-result behaves exactly like the built-in four.
+Four steps, all in your own code. This is the same path the demo's four plugins took —
+there's no privileged built-in set to imitate.
 
 ### Step 1. Write the plugin
 
-Implement `MVIPlugin` and override only the hooks you need. All five have defaults.
+Implement `MVIPlugin` and override only the hooks you need. All five have defaults, and
+dependencies go in your constructor.
 
 | Hook | When it runs | Use it for |
 | --- | --- | --- |
-| `onCreate(viewModel, scope, dependencies)` | Once, during ViewModel construction | Grab the navigator, logger or dispatchers |
-| `onIntent(intent): Boolean` | Before `handleIntent`, for every intent | Observe — or return `true` to **consume** it |
+| `onCreate(viewModel, scope)` | Once, during ViewModel construction | Capture the scope for background work |
+| `onIntent(intent): Boolean` | Before `handleIntent`, for every intent | Observe — or return `true` to **consume** |
 | `onStateChanged(old, new)` | After every `updateState` | React to state without the screen knowing |
 | `onEffectEmitted(effect)` | After every `emitEffect` | Audit or mirror effects |
 | `onCleared()` | With the ViewModel | Release anything you held |
@@ -417,10 +416,6 @@ interface HasUndoPlugin
 
 ### Step 3. Add an accessor
 
-`requirePlugin()` looks your plugin up among the installed ones. Because the property
-extends the marker, it only resolves inside a class that declared it — the same
-compile-time scoping the built-ins get.
-
 ```kotlin
 val HasUndoPlugin.undo: UndoPlugin
     get() = (this as MviViewModel<*, *, *>).requirePlugin()
@@ -430,18 +425,12 @@ Use `pluginOrNull<UndoPlugin>()` instead if the plugin is genuinely optional.
 
 ### Step 4. Install it
 
-Pass it to `additionalPlugins` and implement the marker.
+Pass the instance and implement the marker.
 
 ```kotlin
 class EditorViewModel(
-    dispatcherProvider: DispatcherProvider,
-    pluginDependencies: MviPluginDependencies,
     undoPlugin: UndoPlugin = UndoPlugin(),   // a constructor param, so it can be passed below
-) : MviViewModel<EditViewState, EditIntent, NoEffect>(
-    dispatcherProvider,
-    pluginDependencies,
-    listOf(undoPlugin),
-),
+) : MviViewModel<EditViewState, EditIntent, NoEffect>(listOf(undoPlugin)),
     HasUndoPlugin {
 
     override suspend fun handleIntent(intent: EditIntent) = when (intent) {
@@ -451,26 +440,8 @@ class EditorViewModel(
 }
 ```
 
-That's it. Your plugin gets the same hooks, the same `onCreate` dependencies, and the same
-`intent -> state` visibility as `LoadingPlugin`.
-
-A full worked example, written from outside the library, is in
+A full worked example is in
 [CustomPluginTest.kt](app/src/test/java/com/example/mvi/CustomPluginTest.kt).
-
-### The one difference from a built-in
-
-The base class can't construct your plugin for you, so **you pass it explicitly** in
-Step 4. The built-in four are installed from the marker alone:
-
-```kotlin
-internal val _loadingPlugin = if (this is HasLoadingPlugin) LoadingPluginImpl() else null
-```
-
-Getting that auto-installation is the only reason to edit `:mvi-core` — add the marker to
-`PluginMarkers.kt`, the accessor to `PluginAccessors.kt`, and the install line plus
-`plugins` entry in `MviViewModel`. Worth it for a concern *every* module shares, and not
-otherwise: it costs a change to the base class and makes `:mvi-core` depend on whatever
-your plugin depends on.
 
 ## Running it
 
@@ -486,11 +457,10 @@ and retry. Tap a row for `NavigationPlugin`. Watch Logcat's `Analytics` tag for
 ./gradlew test
 ```
 
-34 JVM unit tests, no emulator: 17 base, 7 plugins standalone, 6 full screen, 4 for
-adding a plugin from outside the library.
+33 JVM unit tests, no emulator: 17 for the base and the plugin mechanism, 6 for the
+example plugins, 6 for a full screen, 4 for writing a plugin from scratch.
 
 ## Not included
 
-No DI framework (a small `ServiceLocator`; in production `MviPluginDependencies` is
-`@Inject`-constructed), no networking (in-memory fake), no `SavedStateHandle` restoration
-— that would make a good fifth plugin.
+No DI framework (a small `ServiceLocator`), no networking (in-memory fake), and no plugins
+in the library itself — that last one on purpose.

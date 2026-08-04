@@ -21,9 +21,9 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.example.mvi.core.error.OperationError
-import com.example.mvi.core.plugins.errors
-import com.example.mvi.core.plugins.loading
+import com.example.mvi.plugins.OperationError
+import com.example.mvi.plugins.errors
+import com.example.mvi.plugins.loading
 import com.example.mvi.data.User
 import com.example.mvi.ui.theme.MviTheme
 

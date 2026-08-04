@@ -4,13 +4,9 @@ import com.example.mvi.core.Intent
 import com.example.mvi.core.MviViewModel
 import com.example.mvi.core.NoEffect
 import com.example.mvi.core.ViewState
-import com.example.mvi.core.helpers.DispatcherProvider
-import com.example.mvi.core.navigation.ChannelNavigator
 import com.example.mvi.core.plugins.MVIPlugin
-import com.example.mvi.core.plugins.MviPluginDependencies
 import com.example.mvi.core.plugins.pluginOrNull
 import com.example.mvi.core.plugins.requirePlugin
-import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -21,44 +17,33 @@ import org.junit.Rule
 import org.junit.Test
 
 /**
- * Everything here lives in `:app`, not in `:mvi-core` — so this is the real test of
- * whether *a consumer of the library* can add a plugin without editing the library.
+ * Writing a plugin from scratch, in four steps.
  *
- * It reproduces the built-in marker + accessor pattern end to end: a marker interface, an
- * accessor built on `requirePlugin()`, and installation through `additionalPlugins`.
+ * `:mvi-core` ships no plugins at all, so this is exactly the same path the app's own
+ * `LoadingPlugin` and `NavigationPlugin` took — there is no privileged built-in set to
+ * imitate. If this works, anything does.
  */
 class CustomPluginTest {
 
     @get:Rule
     val mainDispatcherRule = MainDispatcherRule()
 
-    private fun dispatchers() = TestDispatchers(mainDispatcherRule.testDispatcher)
-
-    private fun dependencies() = MviPluginDependencies(
-        navigator = ChannelNavigator(),
-        analyticsLogger = { },
-        dispatcherProvider = dispatchers(),
-    )
-
-    private fun viewModel(guard: GuardPlugin? = null) =
-        EditorViewModel(dispatchers(), dependencies(), guard = guard)
-
     @Test
-    fun `a plugin defined outside the library is installed and reachable by its marker`() = runTest {
-        val viewModel = viewModel()
+    fun `a plugin is installed and reachable through its marker`() = runTest {
+        val viewModel = EditorViewModel()
 
         viewModel.processIntent(EditIntent.Type("a"))
         viewModel.processIntent(EditIntent.Type("ab"))
         advanceUntilIdle()
 
         assertEquals("ab", viewModel.viewState.value.text)
-        // The accessor resolves exactly like the built-in `loading` or `errors` would.
+        // The accessor resolves, exactly like the app's `loading` or `errors` do.
         assertEquals(listOf("", "a"), viewModel.undo.history)
     }
 
     @Test
-    fun `the custom plugin works from inside handleIntent`() = runTest {
-        val viewModel = viewModel()
+    fun `the plugin is usable from inside handleIntent`() = runTest {
+        val viewModel = EditorViewModel()
 
         viewModel.processIntent(EditIntent.Type("a"))
         viewModel.processIntent(EditIntent.Type("ab"))
@@ -69,9 +54,9 @@ class CustomPluginTest {
     }
 
     @Test
-    fun `a custom plugin can consume an intent before handleIntent sees it`() = runTest {
+    fun `a plugin can consume an intent before handleIntent sees it`() = runTest {
         val guard = GuardPlugin(blocks = { it is EditIntent.Type })
-        val viewModel = viewModel(guard)
+        val viewModel = EditorViewModel(guard = guard)
 
         viewModel.processIntent(EditIntent.Type("hello"))
         advanceUntilIdle()
@@ -83,8 +68,10 @@ class CustomPluginTest {
     }
 
     @Test
-    fun `looking up a plugin that was never installed fails with a useful message`() = runTest {
-        val viewModel = NoPluginsViewModel(dispatchers(), dependencies())
+    fun `a marker without its plugin fails with a message naming the type`() = runTest {
+        // The one thing the compiler cannot check: the marker says the capability is
+        // there, but the plugins list disagrees.
+        val viewModel = ForgotToInstallViewModel()
 
         assertNull(viewModel.pluginOrNull<UndoPlugin>())
 
@@ -95,7 +82,7 @@ class CustomPluginTest {
     }
 }
 
-// ---- Step 1: a plugin written entirely outside :mvi-core ----
+// ---- Step 1: the plugin ----
 
 class UndoPlugin : MVIPlugin {
 
@@ -126,12 +113,12 @@ class GuardPlugin(private val blocks: (Intent) -> Boolean) : MVIPlugin {
 
 interface HasUndoPlugin
 
-// ---- Step 3: the accessor, built on the library's requirePlugin() ----
+// ---- Step 3: the accessor ----
 
 val HasUndoPlugin.undo: UndoPlugin
     get() = (this as MviViewModel<*, *, *>).requirePlugin()
 
-// ---- Step 4: use it ----
+// ---- Step 4: install it ----
 
 private data class EditViewState(val text: String = "") : ViewState
 
@@ -141,16 +128,10 @@ private sealed interface EditIntent : Intent {
 }
 
 private class EditorViewModel(
-    dispatcherProvider: DispatcherProvider,
-    pluginDependencies: MviPluginDependencies,
-    // Held as constructor params so they can be passed to the superclass call below.
+    // Constructor params, so they can be passed to the superclass call below.
     undoPlugin: UndoPlugin = UndoPlugin(),
     guard: GuardPlugin? = null,
-) : MviViewModel<EditViewState, EditIntent, NoEffect>(
-    dispatcherProvider,
-    pluginDependencies,
-    listOfNotNull(undoPlugin, guard),
-),
+) : MviViewModel<EditViewState, EditIntent, NoEffect>(listOfNotNull(undoPlugin, guard)),
     HasUndoPlugin {
 
     val handledIntents = mutableListOf<EditIntent>()
@@ -166,16 +147,11 @@ private class EditorViewModel(
     }
 }
 
-private class NoPluginsViewModel(
-    dispatcherProvider: DispatcherProvider,
-    pluginDependencies: MviPluginDependencies,
-) : MviViewModel<EditViewState, EditIntent, NoEffect>(dispatcherProvider, pluginDependencies) {
+/** Declares the marker but never installs the plugin. */
+private class ForgotToInstallViewModel :
+    MviViewModel<EditViewState, EditIntent, NoEffect>(),
+    HasUndoPlugin {
+
     override fun initialState() = EditViewState()
     override suspend fun handleIntent(intent: EditIntent) = Unit
-}
-
-private class TestDispatchers(private val dispatcher: CoroutineDispatcher) : DispatcherProvider {
-    override val main: CoroutineDispatcher get() = dispatcher
-    override val io: CoroutineDispatcher get() = dispatcher
-    override val default: CoroutineDispatcher get() = dispatcher
 }

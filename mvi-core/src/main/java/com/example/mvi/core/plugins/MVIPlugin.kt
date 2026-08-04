@@ -7,33 +7,37 @@ import com.example.mvi.core.ViewState
 import kotlinx.coroutines.CoroutineScope
 
 /**
- * Base plugin interface — the extension point of the whole architecture.
+ * A capability that observes the MVI loop.
  *
- * A plugin is a self-contained capability (loading, errors, navigation, analytics) that
- * observes the MVI loop through these five hooks. Every method has a default, so a plugin
- * implements only the hooks it cares about.
+ * This is the entire extension mechanism, and the library ships **no implementations** on
+ * purpose. Loading, errors, navigation and analytics are not privileged concepts — they
+ * are just the four plugins the sample app happens to write. Yours sit alongside them as
+ * equals.
  *
- * This is what "delegation" means here: [com.example.mvi.core.MviViewModel] keeps the MVI
- * loop itself, and delegates every *cross-cutting concern* to plugins it installs. Adding
- * a capability to the app never means adding a method to the base class.
+ * Every hook has a default, so a plugin implements only what it cares about. A plugin
+ * takes whatever it needs in its own constructor; the ViewModel that installs it supplies
+ * that.
  */
 interface MVIPlugin {
 
     /**
-     * Called once, when the ViewModel's state is first observed. The plugin receives the
-     * ViewModel, its scope, and the shared [MviPluginDependencies] bag — which is how a
-     * plugin gets a navigator or an analytics logger without every ViewModel having to
-     * inject one it may not use.
+     * Called once, during ViewModel construction, before any intent is handled and before
+     * the subclass's own `init` runs.
+     *
+     * Use it to capture the scope for work that outlives a single intent. Anything the
+     * plugin needs from the app belongs in its constructor instead.
      */
-    fun onCreate(viewModel: ViewModel, viewModelScope: CoroutineScope, dependencies: MviPluginDependencies) {}
+    fun onCreate(viewModel: ViewModel, viewModelScope: CoroutineScope) {}
 
     /**
      * Gives the plugin first look at every intent.
      *
      * Return `true` to mark the intent **handled**, which stops it reaching the
      * ViewModel's `handleIntent`. That is what lets a plugin own a whole class of intents
-     * — a retry, a back press — with no branch in any feature. Return `false` to observe
-     * and pass it on.
+     * with no branch in any feature. Return `false` to observe and pass it on.
+     *
+     * Note a consuming plugin cannot change screen state — `updateState` is the
+     * ViewModel's. Consumption suits guards, gating and interception.
      */
     fun onIntent(intent: Intent): Boolean = false
 
