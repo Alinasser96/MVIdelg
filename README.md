@@ -22,7 +22,7 @@ class ProfileViewModel(
     override fun initialState() = ProfileViewState()
 
     override suspend fun handleIntent(intent: ProfileIntent) = when (intent) {
-        ProfileIntent.Load -> loading.withLoading {
+        ProfileIntent.Load, ProfileIntent.Retry -> loading.withLoading {
             val user = errors.runCatchingError { repository.user(id) } ?: return@withLoading
             updateState { copy(user = user) }
         }
@@ -47,17 +47,19 @@ dependencies {
 
 ## Step 2. Write the contract
 
-One file per screen, three declarations. **Leave out `isLoading` and `errorMessage`** if
-you have plugins holding those — see Step 4.
+One file per screen, three declarations.
 
 ```kotlin
 sealed interface ProfileIntent : Intent {
     data object Load : ProfileIntent
     data object Retry : ProfileIntent
-    data object BackClicked : ProfileIntent
 }
 
-data class ProfileViewState(val user: User? = null) : ViewState
+data class ProfileViewState(
+    val user: User? = null,
+    val isLoading: Boolean = false,
+    val errorMessage: String? = null,
+) : ViewState
 
 sealed interface ProfileEffect : Effect {
     data class ShowMessage(val text: String) : ProfileEffect
@@ -67,25 +69,36 @@ sealed interface ProfileEffect : Effect {
 No one-shot events at all? Use the shared `NoEffect` as your `Effect` type and skip the
 third declaration.
 
-## Step 3. Write the ViewModel
+> Steps 3 and 4 below build **the same screen twice** — first with no plugins, then with
+> two. That's not repetition for its own sake: it's where `isLoading` and `errorMessage`
+> disappear from the state above, and it's the clearest way to see what a plugin is
+> actually for.
 
-Extend `MviViewModel`, implement two functions.
+## Step 3. Write the ViewModel — version 1, no plugins
+
+Extend `MviViewModel`, implement two functions. **Pass no plugins at all**; the argument
+defaults to empty.
 
 ```kotlin
 class ProfileViewModel(
     private val repository: UserRepository,
-    plugins: List<MVIPlugin> = emptyList(),
-) : MviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>(plugins) {
+) : MviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>() {
 
     override fun initialState() = ProfileViewState()
 
     override suspend fun handleIntent(intent: ProfileIntent) {
         when (intent) {
             ProfileIntent.Load, ProfileIntent.Retry -> {
-                val user = repository.user(id)   // suspend call, no launch needed
-                updateState { copy(user = user) }
+                updateState { copy(isLoading = true, errorMessage = null) }
+                try {
+                    val user = repository.user(id)   // suspend call, no launch needed
+                    updateState { copy(user = user) }
+                } catch (e: IOException) {
+                    updateState { copy(errorMessage = e.message) }
+                } finally {
+                    updateState { copy(isLoading = false) }
+                }
             }
-            ProfileIntent.BackClicked -> emitEffect(ProfileEffect.GoBack)
         }
     }
 }
@@ -94,12 +107,13 @@ class ProfileViewModel(
 `handleIntent` is `suspend`, and intents are handled one at a time in order — so call
 suspending code directly. No `launch`.
 
-That is a working screen with **no plugins at all**. Add them when a concern turns out to
-be shared.
+**This is a complete, working screen.** Plugins are entirely optional; if nothing here is
+shared with another screen, stop at this step.
 
-## Step 4. Add plugins for the shared concerns
+## Step 4. The same screen — version 2, with plugins
 
-The demo app writes four. They aren't special — read them as examples and take, adapt or
+The moment a second screen needs that same try/catch/finally, it belongs in a plugin. The
+demo app writes four. They aren't special — read them as examples and take, adapt or
 ignore them.
 
 | Plugin (in `:app`) | Marker | Accessor | What it does |
@@ -109,24 +123,46 @@ ignore them.
 | [`NavigationPlugin`](app/src/main/java/com/example/mvi/plugins/NavigationPlugin.kt) | `HasNavigationPlugin` | `navigation` | `navigateTo(dest)`, `navigateBack()` |
 | [`LoggingPlugin`](app/src/main/java/com/example/mvi/plugins/LoggingPlugin.kt) | `HasLoggingPlugin` | `logging` | `logButtonEvent("id")` |
 
-Install by passing instances, and declare the matching markers:
+Install by passing instances, and declare the matching markers. Here is Step 3's screen
+again, unchanged except where the plugins take over:
 
 ```kotlin
+// Two fields leave the state — the plugins hold them now.
+data class ProfileViewState(val user: User? = null) : ViewState
+
 class ProfileViewModel(
     private val repository: UserRepository,
     plugins: List<MVIPlugin>,
 ) : MviViewModel<ProfileViewState, ProfileIntent, ProfileEffect>(plugins),
-    HasLoadingPlugin,
-    HasErrorPlugin {
-    // `loading` and `errors` are now in scope. `navigation` is not — no marker.
+    HasLoadingPlugin,      // <- puts `loading` in scope
+    HasErrorPlugin {       // <- puts `errors` in scope
+
+    override fun initialState() = ProfileViewState()
+
+    override suspend fun handleIntent(intent: ProfileIntent) {
+        when (intent) {
+            // The whole try/catch/finally above collapses into this.
+            ProfileIntent.Load, ProfileIntent.Retry -> loading.withLoading {
+                val user = errors.runCatchingError { repository.user(id) } ?: return@withLoading
+                updateState { copy(user = user) }
+            }
+        }
+    }
 }
 
 // at the factory
 ProfileViewModel(repository, plugins = listOf(LoadingPlugin(), ErrorPlugin()))
 ```
 
-Leave a marker off and that accessor doesn't exist for your class — a compile error, not a
-null. `standardPlugins("screen_id")` in
+What changed, and nothing else did:
+
+- `isLoading` and `errorMessage` left `ProfileViewState` — no screen declares them again
+- the try/catch/finally became `withLoading` + `runCatchingError`
+- two markers appeared, which is what puts `loading` and `errors` in scope
+
+`navigation` is **not** in scope here — no `HasNavigationPlugin`. Leave a marker off and
+that accessor doesn't exist for your class: a compile error, not a null.
+`standardPlugins("screen_id")` in
 [PluginMarkers.kt](app/src/main/java/com/example/mvi/plugins/PluginMarkers.kt) bundles all
 four for screens that want the lot.
 
