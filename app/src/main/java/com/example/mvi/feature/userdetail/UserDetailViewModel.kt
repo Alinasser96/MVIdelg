@@ -3,7 +3,7 @@ package com.example.mvi.feature.userdetail
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
-import com.example.mvi.core.MviViewModel
+import com.example.mvi.core.plugins.PluggableMviViewModel
 import com.example.mvi.core.NoEffect
 import com.example.mvi.core.plugins.MVIPlugin
 import com.example.mvi.data.UserRepository
@@ -33,7 +33,7 @@ class UserDetailViewModel(
     private val userId: Int,
     private val repository: UserRepository,
     plugins: List<MVIPlugin>,
-) : MviViewModel<UserDetailViewState, UserDetailIntent, NoEffect>(plugins),
+) : PluggableMviViewModel<UserDetailViewState, UserDetailIntent, NoEffect>(plugins),
     HasLoadingPlugin,
     HasErrorPlugin,
     HasNavigationPlugin {

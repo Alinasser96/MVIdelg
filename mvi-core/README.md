@@ -1,6 +1,6 @@
 # `:mvi-core`
 
-The library. Five files, no plugins, no DI framework, no networking, no app code.
+The library. Six files, no plugins, no DI framework, no networking, no app code.
 
 ```kotlin
 dependencies {
@@ -12,11 +12,12 @@ Only `compose/` touches Compose; the rest is plain Kotlin + Coroutines and works
 JVM module with no UI toolkit.
 
 ```
-MviMarkers.kt          ViewState · Intent · Effect · NoEffect
-MviViewModel.kt        the loop
-plugins/MVIPlugin.kt   the extension interface — no implementations
-plugins/PluginLookup.kt requirePlugin() · pluginOrNull()
-compose/MviCompose.kt  CollectEffects
+MviMarkers.kt                     ViewState · Intent · Effect · NoEffect
+MviViewModel.kt                   the loop + four seams — no plugin concept at all
+plugins/MVIPlugin.kt              the extension interface — no implementations
+plugins/PluggableMviViewModel.kt  MviViewModel with the seams wired to a plugin list
+plugins/PluginLookup.kt           requirePlugin() · pluginOrNull()
+compose/MviCompose.kt             CollectEffects
 ```
 
 **There are deliberately no built-in plugins.** Loading, errors, navigation and analytics
@@ -35,10 +36,10 @@ are app concerns; `:app/plugins` shows one way to write them.
 
 ## `MviViewModel<T : ViewState, I : Intent, E : Effect>`
 
+The loop. **No constructor arguments, and no notion of a plugin.**
+
 ```kotlin
-abstract class MviViewModel<T : ViewState, I : Intent, E : Effect>(
-    private val plugins: List<MVIPlugin> = emptyList(),
-) : ViewModel()
+abstract class MviViewModel<T : ViewState, I : Intent, E : Effect> : ViewModel()
 ```
 
 | Member | |
@@ -49,18 +50,45 @@ abstract class MviViewModel<T : ViewState, I : Intent, E : Effect>(
 | `processIntent(i)` | Called by the UI. Non-suspending, ordered, never dropped. |
 | `initialState(): T` *abstract* | The state before anything loads. Called lazily. |
 | `handleIntent(i)` *abstract, suspend* | Route one intent. **May suspend** — intents are serialized, so awaiting is correct. |
-| `updateState { }` *protected* | Atomic reduce via `getAndUpdate`, then broadcast `onStateChanged`. The reducer must be **pure** — it may run twice. |
-| `emitEffect(e)` *protected* | Queue an effect, then broadcast `onEffectEmitted`. Non-suspending. |
-| `pluginOrNull(KClass)` | Find an installed plugin. Backs the reified helpers below. |
+| `updateState { }` *protected* | Atomic reduce via `getAndUpdate`, then run `afterStateUpdate`. The reducer must be **pure** — it may run twice. |
+| `emitEffect(e)` *protected* | Queue an effect, then run `afterEffect`. Non-suspending. |
 
-Intents arrive on a `Channel(UNLIMITED)`. Every plugin sees every intent via
-`plugins.map { it.onIntent(intent) }.any { it }` — mapped before reduced, so a plugin's
-visibility never depends on its position in the list — and any plugin returning `true`
-consumes the intent so `handleIntent` never sees it.
+Intents arrive on a `Channel(UNLIMITED)` and are handled one at a time, in order. Only
+`initialState()` is deferred, because calling an abstract member from the constructor would
+run before the subclass finished initializing.
 
-Plugins are set up in `init`, before any subclass `init` runs, so they are usable from a
-subclass constructor. Only `initialState()` is deferred, because calling an abstract member
-from the base constructor would run before the subclass finished initializing.
+### Seams
+
+Four `protected open` no-ops, typed in your own `T`/`I`/`E`. Override directly for one-off
+behaviour, or extend `PluggableMviViewModel` to have them driven by plugins.
+
+| Seam | Runs |
+| --- | --- |
+| `interceptIntent(intent: I): Boolean` | Before `handleIntent`. Return true to swallow the intent |
+| `afterStateUpdate(oldState: T, newState: T)` | After every `updateState` |
+| `afterEffect(effect: E)` | After every `emitEffect` |
+| `onDispose()` | With `onCleared`, after both channels close |
+
+## `PluggableMviViewModel<T, I, E>`
+
+`MviViewModel` with the four seams forwarded to a list of plugins. That is its entire
+contents.
+
+```kotlin
+abstract class PluggableMviViewModel<T : ViewState, I : Intent, E : Effect>(
+    private val plugins: List<MVIPlugin>,
+) : MviViewModel<T, I, E>()
+```
+
+Adds one member: `pluginOrNull(KClass)`, which backs the reified helpers below.
+
+Every plugin sees every intent via `plugins.map { it.onIntent(intent) }.any { it }` —
+mapped before reduced, so a plugin's visibility never depends on its position in the list.
+
+Plugins are set up in **this class's** `init`, which is the reason the plugin wiring lives
+here rather than in the base: `plugins` is not yet assigned while the base's own `init`
+runs. They are therefore ready before any subclass `init`, so a subclass can use one from
+its own constructor.
 
 ## `MVIPlugin`
 
@@ -96,15 +124,15 @@ class LoadingPlugin : MVIPlugin { ... }                 // 1. the capability
 interface HasLoadingPlugin                              // 2. the marker
 
 val HasLoadingPlugin.loading: LoadingPlugin             // 3. the accessor
-    get() = (this as MviViewModel<*, *, *>).requirePlugin()
+    get() = (this as PluggableMviViewModel<*, *, *>).requirePlugin()
 ```
 
 Because the accessor extends the marker, `loading` only resolves inside a class that
 declared it — a compile error rather than a null. Install by passing an instance:
 
 ```kotlin
-class ProfileViewModel(plugins: List<MVIPlugin>) :
-    MviViewModel<S, I, E>(plugins), HasLoadingPlugin
+class ProfileViewModel :
+    PluggableMviViewModel<S, I, E>(listOf(LoadingPlugin())), HasLoadingPlugin
 ```
 
 Worked example: [CustomPluginTest.kt](../app/src/test/java/com/example/mvi/CustomPluginTest.kt).
